@@ -338,8 +338,12 @@ _PREFLIGHT_PROBES = {
     "tencent":   "http://qt.gtimg.cn/q=sz000001",
     # 同花顺 V6 line API (d.10jqka.com.cn) -- independent provider.
     # Returns daily k-line JSONP data; tested alive 2026-05 during
-    # EM push2 + Sina dual outage. Used as Tier-5 kline fallback.
+    # EM push2 + Sina dual outage. Used as Tier-6 kline fallback.
     "10jqka":    "http://d.10jqka.com.cn/v6/line/sz_000001/01/last.js",
+    # BaoStock (www.baostock.com) -- dedicated server-side A-share API.
+    # No registration, no token, no WAF risk. Primary k-line source;
+    # its TCP API is on a different port range from HTTP crawler targets.
+    "baostock":  "http://www.baostock.com",
 }
 
 
@@ -417,13 +421,17 @@ def _print_data_source_status(probe, ts_tier, ts_info,
     # Sina
     sina_line = "SECONDARY (Sina hq): OK" if sina_alive else "SECONDARY (Sina hq): DEAD"
     print("  " + sina_line)
-    # Tencent QQ stock (Backup-2.5)
+    # BaoStock server API (Primary kline) -- separate infra from all crawlers
+    bs_alive = probe.get("baostock", "fail") == "ok" if probe else False
+    bs_line = "PRIMARY_KLINE (BaoStock API): OK" if bs_alive else "PRIMARY_KLINE (BaoStock API): DEAD"
+    print("  " + bs_line)
+    # Tencent QQ stock (Backup-3)
     tx_alive = probe.get("tencent", "fail") == "ok" if probe else False
-    tx_line = "BACKUP-2.5 (Tencent qt): OK" if tx_alive else "BACKUP-2.5 (Tencent qt): DEAD"
+    tx_line = "BACKUP-3 (Tencent qt): OK" if tx_alive else "BACKUP-3 (Tencent qt): DEAD"
     print("  " + tx_line)
     # 10jqka kline probe
     jq_alive = probe.get("10jqka", "fail") == "ok" if probe else False
-    jq_line = "BACKUP-5 (10jqka kline): OK" if jq_alive else "BACKUP-5 (10jqka kline): DEAD"
+    jq_line = "BACKUP-6 (10jqka kline): OK" if jq_alive else "BACKUP-6 (10jqka kline): DEAD"
     print("  " + jq_line)
     # Tushare
     if ts_tier == "unset":
@@ -480,7 +488,11 @@ def _print_data_source_status(probe, ts_tier, ts_info,
             if probe.get("em_sector") != "ok":
                 print("  ⚠️ em_sector 挂; C 策略将走 stale-cache → tushare 行业聚合")
             if probe.get("em_kline") != "ok":
-                print("  ⚠️ em_kline 挂; K线将走 Sina/Tencent QT/EM-quote/tushare daily 链")
+                bs_ok = probe.get("baostock") == "ok" if probe else False
+                if bs_ok:
+                    print("  ⚠️ em_kline 挂; K线主走 BaoStock (独立服务器, 不受影响)")
+                else:
+                    print("  ⚠️ em_kline 挂; K线将走 BaoStock→Tushare→Sina→QT→10jqka→EM→163 链")
         # Action hint
         print()
         print("[行动建议]")
@@ -748,6 +760,14 @@ def _code_to_sina(code):
     if c[0] == "6" or c.startswith("688"):
         return f"sh{c}"
     return f"sz{c}"
+
+
+def _bs_symbol(code):
+    """6-digit A-share code -> BaoStock symbol (sh.600519 / sz.000001)."""
+    c = (code or "").strip()
+    if len(c) != 6 or not c.isdigit():
+        return None
+    return ("sh." if (c[0] == "6" or c.startswith("688")) else "sz.") + c
 
 
 def _fetch_sina_batch(codes, batch_size=400):
@@ -3302,6 +3322,101 @@ def _fetch_tushare_main_inflow_5d(codes=None):
     return cumulative
 
 
+# BaoStock module-level session management.
+# The SDK uses a global TCP connection internally; concurrent login/logout
+# per call floods the server and triggers WinError 10053/WinError 10038.
+# We login ONCE, serialize all queries under a lock, and keep the session
+# alive for the entire batch run. The server auto-expires idle sessions.
+import threading as _threading
+_BS_LOCK = _threading.Lock()
+_BS_IMPORTED = False
+_BS_LOGGED_IN = False
+_BS_MODULE = None
+
+
+def _bs_ensure_session():
+    """Ensure BaoStock is imported and logged in (caller MUST hold _BS_LOCK)."""
+    global _BS_IMPORTED, _BS_LOGGED_IN, _BS_MODULE
+    if not _BS_IMPORTED:
+        try:
+            import baostock as _bs
+            _BS_MODULE = _bs
+            _BS_IMPORTED = True
+        except ImportError:
+            return False
+    if not _BS_LOGGED_IN:
+        lg = _BS_MODULE.login()
+        if lg.error_code != '0':
+            return False
+        _BS_LOGGED_IN = True
+    return True
+
+
+def _fetch_baostock_kline(code, n=30, period="d"):
+    """Tier-1 k-line: BaoStock server-side API.
+
+    No registration, no token, no cost. Server-side push (not scraping),
+    so WAF/rate-limit risk is near zero. Returns same schema as Sina.
+
+    Uses a module-level session: login ONCE, serialize under lock,
+    keep session alive across batch calls. Never logout -- the server
+    auto-expires idle connections.
+
+    Args:
+        code: 6-digit A-share code.
+        n: number of bars requested.
+        period: "d" daily, "w" weekly, "m" monthly, "5"/"15"/"30"/"60" minute.
+    Returns list of {ts, open, close, high, low, vol, amount} ascending;
+        empty list on failure.
+    """
+    sym = _bs_symbol(code)
+    if not sym:
+        return []
+    end = datetime.datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.datetime.now() - datetime.timedelta(days=int(n * 1.6) + 10)
+             ).strftime("%Y-%m-%d")
+    with _BS_LOCK:
+        if not _bs_ensure_session():
+            return []
+        bs = _BS_MODULE
+        try:
+            rs = bs.query_history_k_data_plus(
+                sym,
+                "date,open,high,low,close,volume,amount",
+                start_date=start, end_date=end,
+                frequency=period, adjustflag="2",
+            )
+            if rs.error_code != '0':
+                return []
+            rows = []
+            while rs.next():
+                row = rs.get_row_data()
+                if not row or len(row) < 7:
+                    continue
+                ts = row[0]
+                if not ts:
+                    continue
+                try:
+                    rows.append({
+                        "ts": ts,
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "vol": float(row[5]),
+                        "amount": float(row[6]),
+                        "_source": "baostock",
+                    })
+                except (ValueError, TypeError):
+                    continue
+            rows.sort(key=lambda r: r["ts"])
+            if len(rows) > n:
+                rows = rows[-n:]
+            return rows
+        except Exception:
+            return []
+
+
 def _fetch_sina_kline(code, scale, n):
     """Fetch k-lines from Sina (scale=240 day, 60/30/15/5 minute).
 
@@ -3349,38 +3464,38 @@ def _fetch_daily_kline(code, n=30):
     Returns a list of dicts {date, open, close, high, low, vol, amount}
     in ASCENDING date order. Empty list on failure.
 
-    Six-source fallback chain (each on a different provider/domain
-    so a single WAF rule can't take all six at once):
-      1. Sina quotes.sina.cn  -- primary (20-year stable endpoint)
-      2. Tencent QT ifzq.gtimg.cn  -- fallback when Sina returns 0 bars
-      3. EM push2his.eastmoney.com  -- third-tier on a separate subdomain
-      4. Tushare api.tushare.pro  -- auth-backed independent channel
-      5. 同花顺 d.10jqka.com.cn  -- V6 line API, semicolon-separated daily
-         bars; tested 2026-05 alive through EM + Sina dual outage
-      6. NetEase 163 quotes.money.163.com  -- pure CSV, most WAF-resistant
+    Seven-source fallback chain, ordered by real-world success rate
+    (server APIs first, then stable crawler targets, flaky ones last):
+      1. BaoStock  baostock.com       -- server API, no auth, near-zero WAF risk
+      2. Tushare   api.tushare.pro    -- auth-backed server API (fast fail w/o token)
+      3. Sina      quotes.sina.cn     -- most stable public crawler, 20yr track record
+      4. Tencent QT ifzq.gtimg.cn    -- independent IP range from EM/Sina
+      5. 同花顺    d.10jqka.com.cn    -- confirmed alive through EM+Sina dual outage
+      6. EM push2his                  -- EM subdomain, often blocked with push2
+      7. NetEase 163                  -- currently flaky, last resort
 
     Joint failure is extremely improbable; we never fall through to
     empty unless every upstream is down at once.
     """
-    # Try Sina first (primary)
-    raw = _fetch_sina_kline(code, scale=240, n=n)
+    # Tier-1: BaoStock server API (highest success rate, no WAF)
+    raw = _fetch_baostock_kline(code, n=n)
     if not raw:
-        # Fall back to QT. A 0-row Sina response may mean upstream hiccup
-        # or a genuinely new/halted stock. QT disambiguates.
-        raw = _fetch_qt_kline(code, scale=240, n=n)
-    if not raw:
-        # Tier-3: EM on a separate subdomain. Survives push2 WAF outages.
-        raw = _fetch_em_kline(code, scale=240, n=n)
-    if not raw:
-        # Tier-4: tushare HTTP API (no-op when no token is configured).
+        # Tier-2: Tushare auth-backed API (fast fail when no token)
         raw = _fetch_tushare_kline(code, n=n)
     if not raw:
-        # Tier-5: 同花顺 V6 line API, confirmed alive during mid-2026
-        # EM push2 + Sina dual outage. Returns up to 140 recent bars.
+        # Tier-3: Sina -- most stable public crawler
+        raw = _fetch_sina_kline(code, scale=240, n=n)
+    if not raw:
+        # Tier-4: Tencent QT -- independent provider
+        raw = _fetch_qt_kline(code, scale=240, n=n)
+    if not raw:
+        # Tier-5: 同花顺 -- survived EM+Sina dual outage
         raw = _fetch_10jqka_kline(code, n=n)
     if not raw:
-        # Tier-6: NetEase 163 CSV -- currently returns 502 from mainland
-        # mobile networks as of mid-2026; function kept ready for recovery.
+        # Tier-6: EM -- often blocked, but separate subdomain from push2
+        raw = _fetch_em_kline(code, scale=240, n=n)
+    if not raw:
+        # Tier-7: NetEase 163 -- currently 502, emergency last resort
         raw = _fetch_163_kline(code, n=n)
     rows = []
     for r in raw:
@@ -3523,13 +3638,21 @@ _KLT_60MIN = 60
 
 
 def _fetch_minute_kline(code, klt, n):
-    """Fetch `n` recent minute-level k-lines (ascending) via Sina.
+    """Fetch `n` recent minute-level k-lines (ascending).
 
     `klt` is the minute scale (5 / 15 / 30 / 60). Data is NOT forward-adjusted
     (no fqt option), but for intraday features this is fine: no dividend/split
     event within a single session.
+
+    Two-source chain, ordered by success rate:
+      1. BaoStock  -- server API, stable minute-line endpoint
+      2. Sina       -- public crawler, fallback when BaoStock unavailable
     """
-    return _fetch_sina_kline(code, scale=klt, n=n)
+    period = str(klt)
+    raw = _fetch_baostock_kline(code, n=n, period=period)
+    if not raw:
+        raw = _fetch_sina_kline(code, scale=klt, n=n)
+    return raw
 
 
 def get_minute_klines_batch(codes, klt, n, workers=8, use_cache=True):
@@ -9143,7 +9266,7 @@ def _quote_em(code):
     """Single-code real-time quote via East Money push2. None on failure."""
     sid = _secid_for_quote(code)
     url = (f"https://push2.eastmoney.com/api/qt/stock/get?secid={sid}"
-           "&fields=f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f117,f170,f171")
+           "&fields=f43,f44,f45,f46,f47,f48,f50,f57,f58,f59,f60,f62,f116,f117,f170,f171")
     try:
         d = requests.get(url, headers={**_H, "Referer": _REF_EM},
                          timeout=TIMEOUT).json().get("data")
@@ -9162,6 +9285,8 @@ def _quote_em(code):
             "prev_close": round(d.get("f60", 0) / div, dp),
             "vol": d.get("f47", 0), "amount": d.get("f48", 0),
             "total_mv": d.get("f116", 0), "float_mv": d.get("f117", 0),
+            "volume_ratio": d.get("f50", 0) / 100.0 if d.get("f50") else None,
+            "main_inflow": d.get("f62", 0),
         }
     except Exception:
         return None
@@ -9332,6 +9457,14 @@ _REGIME_THRESHOLDS = {
     "BREAKOUT_VOL_LO": 1.2,
     "BREAKOUT_BAND_MULT_LO": 0.4,
     "BREAKOUT_BAND_MULT_HI": 0.8,
+    # RANGE_BOTTOM: 箱体底部检测 (盖在 DEEP_LOSS 之上, 防止箱底止损)
+    # - 箱体必须有足够的跨度 (span ≥ 5%) 和足够的触点数 (≥2次碰底+碰顶)
+    # - 当价格在箱底 20% 区间且未破箱底时, 不触发 DEEP_LOSS, 改为做T/持有观察
+    # - 只有确认破箱底 (价格跌破箱底) 才从严按 DEEP_LOSS 处理
+    "RANGE_BOTTOM_SPAN_MIN": 5.0,
+    "RANGE_BOTTOM_TOUCHES_MIN": 2,
+    "RANGE_BOTTOM_ZONE_PCT": 20.0,
+    "RANGE_BOTTOM_BREAK_PCT": 2.0,
 }
 
 
@@ -9411,7 +9544,9 @@ def _compute_range_metrics(quote, hist_rows, today_bar=None):
     Returns dict with float fields (None if data insufficient).
     """
     out = {"atr14_pct": None, "atr5_pct": None, "recent10_span_pct": None,
-           "intraday_range_pct": None, "vol_ratio_5d": None}
+           "intraday_range_pct": None, "vol_ratio_5d": None,
+           "range_20d_high": None, "range_20d_low": None,
+           "position_in_range_pct": None, "range_quality": None}
     if hist_rows and len(hist_rows) >= 14:
         # ATR14 (full window)
         atr_window_14 = hist_rows[-14:]
@@ -9461,13 +9596,84 @@ def _compute_range_metrics(quote, hist_rows, today_bar=None):
         avg5 = sum(r["vol"] for r in hist_rows[-5:]) / 5
         if avg5 > 0:
             out["vol_ratio_5d"] = today_vol / avg5
+    # 20-day range detection for RANGE_BOTTOM / T-trade analysis
+    if hist_rows and len(hist_rows) >= 20:
+        # Multi-window: 20d (overall), 10d (recent), 5d (tight)
+        for win, key_prefix in [(20, "range_20d"), (10, "range_10d"), (5, "range_5d")]:
+            if len(hist_rows) < win:
+                continue
+            sw = hist_rows[-win:]
+            hi = max(r["high"] for r in sw)
+            lo = min(r["low"] for r in sw)
+            avg_c = sum(r["close"] for r in sw) / len(sw)
+            if avg_c > 0 and hi > lo:
+                span_pct = (hi - lo) / avg_c * 100
+                last_close = sw[-1]["close"]
+                pos_pct = (last_close - lo) / (hi - lo) * 100 if hi > lo else 50
+                touch_band = (hi - lo) * 0.05
+                top_t = sum(1 for r in sw if r["high"] >= hi - touch_band)
+                bot_t = sum(1 for r in sw if r["low"] <= lo + touch_band)
+                span_score = "wide" if span_pct >= 10 else ("normal" if span_pct >= 5 else "narrow")
+                out[f"{key_prefix}_high"] = hi
+                out[f"{key_prefix}_low"] = lo
+                out[f"{key_prefix}_span_pct"] = round(span_pct, 1)
+                out[f"{key_prefix}_position_pct"] = round(pos_pct, 1)
+                out[f"{key_prefix}_top_touches"] = top_t
+                out[f"{key_prefix}_bot_touches"] = bot_t
+                out[f"{key_prefix}_score"] = span_score
+        # Synthesise: pick the best range for current regime classification.
+        # Logic: if 5d span is "narrow" (<5%) but 20d span is "wide" (≥10%),
+        # the stock recently collapsed into a tighter band → use 20d for
+        # overall context but 5d/10d for trading-relevant levels.
+        # If 5d span ≥ 3% and has touches at both ends → it's a tradable tight range.
+        # Otherwise use 10d as the primary working range.
+        r5s = out.get("range_5d_span_pct")
+        r10s = out.get("range_10d_span_pct")
+        r20s = out.get("range_20d_span_pct")
+        r5bt = out.get("range_5d_bot_touches", 0)
+        r5tt = out.get("range_5d_top_touches", 0)
+        # Determine primary working range for T-trade.
+        # Touches threshold scales with window: 5d→1, 10d→1, 20d→2
+        # A declining stock may only peak once — 2+ touches is unreasonable for 5-10d.
+        if r5s and r5s >= 3 and r5tt >= 1 and r5bt >= 1:
+            # 5d tight range with confirmed touches — use as primary
+            out["range_high"] = out["range_5d_high"]
+            out["range_low"] = out["range_5d_low"]
+            out["position_in_range_pct"] = out["range_5d_position_pct"]
+            out["range_quality"] = {
+                "span_pct": r5s, "top_touches": r5tt, "bot_touches": r5bt,
+                "span_score": out.get("range_5d_score", "narrow"),
+                "window": "5d",
+            }
+        elif r10s and r10s >= 4 and out.get("range_10d_top_touches", 0) >= 1 and out.get("range_10d_bot_touches", 0) >= 1:
+            out["range_high"] = out["range_10d_high"]
+            out["range_low"] = out["range_10d_low"]
+            out["position_in_range_pct"] = out["range_10d_position_pct"]
+            out["range_quality"] = {
+                "span_pct": r10s, "top_touches": out.get("range_10d_top_touches", 0),
+                "bot_touches": out.get("range_10d_bot_touches", 0),
+                "span_score": out.get("range_10d_score", "normal"),
+                "window": "10d",
+            }
+        else:
+            # Fall back to 20d (most inclusive)
+            out["range_high"] = out.get("range_20d_high")
+            out["range_low"] = out.get("range_20d_low")
+            out["position_in_range_pct"] = out.get("range_20d_position_pct")
+            out["range_quality"] = {
+                "span_pct": r20s or 0, "top_touches": out.get("range_20d_top_touches", 0),
+                "bot_touches": out.get("range_20d_bot_touches", 0),
+                "span_score": out.get("range_20d_score", "normal"),
+                "window": "20d",
+            }
     return out
 
 
 def _classify_regime(profit_pct, ma5_trend, atr14_pct, span10_pct,
                      vol_ratio, main_inflow, now_time,
-                     is_trading=True, atr5_pct=None):
-    """Hard-classify a holding into one of 11 regimes.
+                     is_trading=True, atr5_pct=None,
+                     range_quality=None, position_in_range_pct=None):
+    """Hard-classify a holding into one of 12 regimes (including RANGE_BOTTOM).
 
     Returns dict with: regime, action_type, upper_pct_range, lower_pct_range,
     max_sell_frac, max_buy_frac, sell_ladder_hint, min_spread_pct, reason.
@@ -9500,11 +9706,83 @@ def _classify_regime(profit_pct, ma5_trend, atr14_pct, span10_pct,
                     max_sell_frac=1.0, sell_ladder_hint="single",
                     reason="14:55+ 收盘冲刺，挂现价/对手价快速出货")
 
-    # 2. DEEP_LOSS (hard stop)
+    # 1.5. RANGE_BOTTOM — 箱体底部检测 (优先于 DEEP_LOSS)
+    # 当股票在 20 日箱体内且价格接近箱底时，即使 profit% ≤ -4.5% 也不机械止损。
+    # 箱体震荡的底部往往是做T买点而不是止损卖点；只有箱底真实破位才走 DEEP_LOSS。
+    if (profit_pct is not None and profit_pct <= T["DEEP_LOSS_PCT"]
+            and range_quality is not None
+            and position_in_range_pct is not None):
+        span = range_quality.get("span_pct", 0)
+        top_t = range_quality.get("top_touches", 0)
+        bot_t = range_quality.get("bot_touches", 0)
+        rwin = range_quality.get("window", "20d")
+        # Touches requirement scales with window: 5d/10d→1, 20d→2
+        req_touches = 2 if rwin == "20d" else 1
+        # Must have a well-defined range: wide enough + touched both ends
+        if (span >= T["RANGE_BOTTOM_SPAN_MIN"]
+                and top_t >= req_touches
+                and bot_t >= req_touches):
+            # At bottom zone: position ≤ RANGE_BOTTOM_ZONE_PCT% from low
+            if position_in_range_pct <= T["RANGE_BOTTOM_ZONE_PCT"]:
+                # This is a箱底, not a breakdown — do NOT stop-loss blindly.
+                # Strategy: if main_inflow is neutral/positive, suggest T-trade
+                # (buy at bottom, sell at mid/top). If main_inflow is negative
+                # and volume rising, it might be breaking down — use stricter check.
+                infl_neg = (main_inflow is not None and main_inflow < 0)
+                vol_high = (vol_ratio is not None and vol_ratio >= 1.5)
+                if infl_neg and vol_high:
+                    # Heavy selling at箱底 — could be real breakdown
+                    # Fall through to DEEP_LOSS below (don't return here)
+                    pass
+                else:
+                    # 箱底震荡, 做T / 持有观察, 不盲目止损
+                    t_trade_note = ""
+                    low_pct = None
+                    if span >= 3:
+                        # Range is wide enough for T-trade to cover fees
+                        mid_of_range = span / 2
+                        t_trade_note = (
+                            f"{rwin}箱体[{span:.1f}%]底部 "
+                            f"(位置{position_in_range_pct:.0f}%), "
+                            f"建议做T: 在现价区低吸, 反弹至箱体中/上沿"
+                            f"({mid_of_range:.1f}%~{span:.1f}%) 卖出;"
+                        )
+                        low_pct = (-2.0, -0.5)
+                    inflow_note = ""
+                    if main_inflow is not None:
+                        infl_w = main_inflow / 10000
+                        if main_inflow > 0:
+                            inflow_note = f" 主力净流入 +{infl_w:.0f}万→做T确认度提升"
+                        elif main_inflow < 0:
+                            inflow_note = f" 主力净流出 {infl_w:.0f}万→做T需谨慎"
+                    return dict(base, regime="RANGE_BOTTOM", action_type="LOW_BUY_ONLY",
+                                lower_pct_range=low_pct,
+                                max_buy_frac=0.5, sell_ladder_hint="none",
+                                reason=(f"profit {profit_pct:+.2f}% ≤ {T['DEEP_LOSS_PCT']}% 但 "
+                                        f"{rwin}箱体[{span:.1f}%]内(位置{position_in_range_pct:.0f}%), "
+                                        f"箱底未破({bot_t}次碰底{top_t}次碰顶), "
+                                        f"不触发机械止损.{inflow_note} {t_trade_note}"
+                                        f"若主力持续流出+放量破箱底则升级 DEEP_LOSS"))
+
+    # 2. DEEP_LOSS (hard stop — only when range not protecting, or real breakdown)
     if profit_pct is not None and profit_pct <= T["DEEP_LOSS_PCT"]:
+        reason_extra = ""
+        if range_quality and range_quality.get("span_pct", 0) >= T["RANGE_BOTTOM_SPAN_MIN"]:
+            rw = range_quality.get("window", "20d")
+            tt = range_quality.get("top_touches", 0)
+            bt = range_quality.get("bot_touches", 0)
+            req = 2 if rw == "20d" else 1
+            if tt < req or bt < req:
+                # Range exists but lacks enough touches → can't confirm as valid box
+                reason_extra = (f" ({rw}箱体{range_quality['span_pct']:.1f}%但触点不足"
+                               f"(顶{tt}/底{bt},需各≥{req}), 无法确认箱体有效性)")
+            else:
+                # Has a valid range but position/flow signals suggest breakdown
+                reason_extra = (f" ({rw}箱体{range_quality['span_pct']:.1f}%但箱底确认破位/抛压加重, "
+                               f"严格止损)")
         return dict(base, regime="DEEP_LOSS", action_type="SELL_ALL",
                     max_sell_frac=1.0, sell_ladder_hint="single",
-                    reason=f"profit {profit_pct:+.2f}% ≤ {T['DEEP_LOSS_PCT']}%, 纪律止损")
+                    reason=f"profit {profit_pct:+.2f}% ≤ {T['DEEP_LOSS_PCT']}%, 纪律止损{reason_extra}")
 
     # 3. TAIL_EXIT (after 14:30 + still red + MA5 not strongly up)
     if (now_time >= datetime.time(14, 30) and profit_pct is not None
@@ -9703,6 +9981,15 @@ def _suggest_orders(code, name, qty_total, avail, price, regime, target_yuan):
     atype = regime["action_type"]
     if atype == "NO_OP" or not price or price <= 0:
         return []
+    # RANGE_BOTTOM: buy-only near 箱底, no sell side
+    if regime["regime"] == "RANGE_BOTTOM":
+        if regime["lower_pct_range"] and regime["max_buy_frac"] > 0:
+            lo, hi = regime["lower_pct_range"]
+            mid = round((lo + hi) / 2, 2)
+            cap_buy = _round_lot(qty_total * regime["max_buy_frac"])
+            buy_q = max(100, min(_round_lot(target_yuan / price), cap_buy))
+            return [f"{code}:buy:{buy_q}@{mid:+.2f}"] if buy_q >= 100 else []
+        return []
     # shares per single order ~ target_yuan worth, lot-rounded, min 100
     spo = max(100, _round_lot(target_yuan / price))
 
@@ -9767,6 +10054,13 @@ def _build_plan_rows(holdings, now, target_yuan=10000.0, is_trading=True):
     codes = [h[0] for h in holdings]
     quotes = {c: query_quote(c) for c in codes}
     klines = get_daily_klines_batch(codes, n=30, workers=min(8, len(codes)))
+    # Batch-fetch main_inflow via ulist (f62 only works in clist/ulist, not stock/get)
+    infl_batch_map = {}
+    try:
+        infl_rows = _fetch_market_by_codes(codes)
+        infl_batch_map = {r["code"]: r.get("main_inflow", 0) for r in infl_rows if r.get("code")}
+    except Exception:
+        pass
     today_str = now.strftime("%Y%m%d")
     rows = []
     for code, qty, avail, cost in holdings:
@@ -9774,7 +10068,9 @@ def _build_plan_rows(holdings, now, target_yuan=10000.0, is_trading=True):
         name = q.get("name", "?")
         price = q.get("price")
         pct_today = q.get("pct")
-        main_inflow = q.get("main_inflow")
+        # Prefer batch-fetched main_inflow (ulist/clist f62) over single-quote (usually 0/None)
+        main_inflow = infl_batch_map.get(code) if infl_batch_map.get(code) else q.get("main_inflow")
+        vol_ratio_from_quote = q.get("volume_ratio")
         kl = klines.get(code) or []
         # Split today's bar (potentially partial) from history.
         hist = [r for r in kl if r.get("date") != today_str]
@@ -9789,6 +10085,20 @@ def _build_plan_rows(holdings, now, target_yuan=10000.0, is_trading=True):
             if lows_10:
                 low_10d = min(lows_10)
         metrics = _compute_range_metrics(q, hist, today_bar=today_bar)
+        # Override position_in_range_pct with TODAY's real price (metrics uses yesterday's close)
+        if metrics.get("range_high") and metrics.get("range_low") and price:
+            rhi = metrics["range_high"]
+            rlo = metrics["range_low"]
+            if rhi > rlo:
+                real_pos = round((price - rlo) / (rhi - rlo) * 100, 1)
+                metrics["position_in_range_pct"] = max(0, min(100, real_pos))
+                # Also update per-window positions
+                for win in ["5d", "10d", "20d"]:
+                    whi = metrics.get(f"range_{win}_high")
+                    wlo = metrics.get(f"range_{win}_low")
+                    if whi and wlo and whi > wlo:
+                        wpos = round((price - wlo) / (whi - wlo) * 100, 1)
+                        metrics[f"range_{win}_position_pct"] = max(0, min(100, wpos))
         profit_pct = None
         if cost and price and cost > 0:
             profit_pct = (price - cost) / cost * 100
@@ -9801,6 +10111,8 @@ def _build_plan_rows(holdings, now, target_yuan=10000.0, is_trading=True):
             now_time=now.time(),
             is_trading=is_trading,
             atr5_pct=metrics.get("atr5_pct"),
+            range_quality=metrics.get("range_quality"),
+            position_in_range_pct=metrics.get("position_in_range_pct"),
         )
         # Post-classify sanity: LOW_DIP buy price must not break the 10-day
         # swing low (hard floor).  MA10 is a soft lagging level—a healthy
@@ -9825,7 +10137,17 @@ def _build_plan_rows(holdings, now, target_yuan=10000.0, is_trading=True):
             "span10_pct": metrics["recent10_span_pct"],
             "intraday_range_pct": metrics["intraday_range_pct"],
             "vol_ratio_5d": metrics["vol_ratio_5d"],
+            "vol_ratio_today": vol_ratio_from_quote,
             "profit_pct": profit_pct,
+            # Multi-window range data
+            "range_20d_high": metrics.get("range_20d_high"),
+            "range_20d_low": metrics.get("range_20d_low"),
+            "range_10d_high": metrics.get("range_10d_high"),
+            "range_10d_low": metrics.get("range_10d_low"),
+            "range_5d_high": metrics.get("range_5d_high"),
+            "range_5d_low": metrics.get("range_5d_low"),
+            "position_in_range_pct": metrics.get("position_in_range_pct"),
+            "range_quality": metrics.get("range_quality"),
             "regime": regime,
             "suggest_orders": suggest,
         })
@@ -9864,8 +10186,8 @@ def _render_state_block(now, sess_meta, target_yuan, holdings_count,
 def _render_holdings_data(rows):
     print("\n[HOLDINGS_DATA]  (每只客观特征, LLM 在 S1/S2 中使用)")
     print("| # | 代码 | 名称 | 总持仓 | 可用 | 成本 | 现价 | 今日% | profit% "
-          "| MA5 | 趋势 | atr14% | atr5% | span10% | 盘中振幅% | 量比5d | 主力净流入(万) |")
-    print("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|:--:|---:|---:|---:|---:|---:|---:|")
+          "| MA5 | 趋势 | atr14% | atr5% | span10% | 盘中振幅% | 量比5d | 主力净流入(万) | 主力流方向 | 5d箱体 | 10d箱体 | 20d箱体 | 箱体位% |")
+    print("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|:--:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---:|---:|")
     for i, p in enumerate(rows, 1):
         infl = p["main_inflow"]
         infl_w = (infl / 10000.0) if isinstance(infl, (int, float)) else None
@@ -9875,6 +10197,26 @@ def _render_holdings_data(rows):
         a5 = p.get("atr5_pct")
         if a14 and a5 and a5 > 0 and a14 > a5 * 2.0:
             atr5_str += " ⚠"  # decay warning
+        # Multi-window range summaries
+        def _range_short(h, l):
+            if h is None or l is None:
+                return "-"
+            return f"{l:.2f}-{h:.2f}"
+        r5 = _range_short(p.get("range_5d_high"), p.get("range_5d_low"))
+        r10 = _range_short(p.get("range_10d_high"), p.get("range_10d_low"))
+        r20 = _range_short(p.get("range_20d_high"), p.get("range_20d_low"))
+        rpos = p.get("position_in_range_pct")
+        pos_str = f"{rpos:.0f}%" if rpos is not None else "-"
+        # Fund flow direction tag
+        if isinstance(infl, (int, float)):
+            if infl > 0:
+                flow_dir = "🟢流入"
+            elif infl < 0:
+                flow_dir = "🔴流出"
+            else:
+                flow_dir = "⚪平盘"
+        else:
+            flow_dir = "-"
         print(f"| {i} | `{p['code']}` | {p['name']} | {p['qty']} | {p['avail']} "
               f"| {_fmt_v(p['cost'])} | {_fmt_v(p['price'])} | "
               f"{_fmt_v(p['pct_today'], '%', sign=True)} | "
@@ -9885,7 +10227,12 @@ def _render_holdings_data(rows):
               f"{_fmt_v(p['span10_pct'], '%')} | "
               f"{_fmt_v(p['intraday_range_pct'], '%')} | "
               f"{_fmt_v(p['vol_ratio_5d'])} | "
-              f"{_fmt_v(infl_w, sign=True)} |")
+              f"{_fmt_v(infl_w, sign=True)} | "
+              f"{flow_dir} | "
+              f"{r5} | "
+              f"{r10} | "
+              f"{r20} | "
+              f"{pos_str} |")
 
 
 def _fmt_pct_range(rng):
@@ -9894,6 +10241,81 @@ def _fmt_pct_range(rng):
         return "-"
     lo, hi = rng
     return f"[{lo:+.2f}%, {hi:+.2f}%]"
+
+
+def _render_holdings_flow(rows):
+    """Print [HOLDINGS_FLOW] — 全持仓资金流汇总, 辅助做T决策。"""
+    infls = []
+    for p in rows:
+        v = p.get("main_inflow")
+        if isinstance(v, (int, float)):
+            infls.append((p["code"], p["name"], v))
+    if not infls:
+        return
+    total = sum(v for _, _, v in infls)
+    pos_count = sum(1 for _, _, v in infls if v > 0)
+    neg_count = sum(1 for _, _, v in infls if v < 0)
+    neutral_count = sum(1 for _, _, v in infls if v == 0)
+    # Dominant direction
+    if pos_count > neg_count:
+        direction = "偏多" if total > 0 else "多空分歧(总额偏空)"
+    elif neg_count > pos_count:
+        direction = "偏空" if total < 0 else "多空分歧(总额偏多)"
+    else:
+        direction = "多空均衡"
+    total_w = total / 10000.0
+    print("\n[HOLDINGS_FLOW] (全持仓资金流汇总 — 判断整体板块是否有资金关照)")
+    print(f"  主力净流入合计: {total_w:+.0f}万  ({direction})")
+    print(f"  净流入 {pos_count} 只 / 净流出 {neg_count} 只 / 平盘 {neutral_count} 只")
+    # Per-stock flow
+    print("  ─────────────────────────────────────────────────")
+    for code, name, v in sorted(infls, key=lambda x: x[2], reverse=True):
+        vw = v / 10000.0
+        bar = "█" * min(10, max(1, int(abs(vw) / 100)))
+        sign = "+" if v >= 0 else ""
+        tag = "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
+        print(f"  {tag} {code} {name}: {sign}{vw:.0f}万 {bar}")
+    print()
+    print("  【做T参考】若整体偏多 + 个股箱底 → 做T买点确认度提升;")
+    print("  若整体偏空 + 个股箱底 → 警惕真破位, 做T设紧止损;")
+    print("  若个股逆势 (整体偏空但它净流入) → 可能独立资金运作, 值得留意。")
+
+
+def _render_market_flow():
+    """Print [MARKET_FLOW] — 大盘指数资金参与度信号, 辅助判断市场环境。"""
+    try:
+        overview = get_market_overview(use_cache=True)
+    except Exception:
+        return
+    if not overview:
+        return
+    print("\n[MARKET_FLOW] (大盘资金参与度快照)")
+    total_amount = 0.0
+    up_count = 0
+    down_count = 0
+    for idx in overview:
+        name = idx.get("name", "?")
+        pct = idx.get("pct", 0)
+        amount = idx.get("amount", 0)
+        total_amount += amount
+        if pct > 0:
+            up_count += 1
+        elif pct < 0:
+            down_count += 1
+        tag = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+        amt_str = _fmt_amount(amount)
+        print(f"  {tag} {name}: {pct:+.2f}%  成交 {amt_str}")
+    total_amt_str = _fmt_amount(total_amount)
+    ratio = f"{up_count}涨{down_count}跌" if (up_count + down_count) > 0 else "平盘"
+    print(f"  合计成交: {total_amt_str}  |  {ratio}")
+    # Quick judgment
+    if up_count > down_count and up_count >= 5:
+        print("  → 大盘普涨, 做T卖出端可略激进 (挂上沿 or ATR 上限)")
+    elif down_count > up_count and down_count >= 5:
+        print("  → 大盘普跌, 做T买入端需谨慎 (等箱底确认+缩量企稳)")
+    else:
+        print("  → 指数分化, 做T按个股箱体独立判断")
+    print()
 
 
 def _render_regime_classify(rows):
@@ -9923,14 +10345,18 @@ def _render_regime_classify(rows):
 
 def _render_regime_rules():
     T = _REGIME_THRESHOLDS
-    print("\n[REGIME_RULES]  (11 档 regime 决策矩阵, 第一命中)")
+    print("\n[REGIME_RULES]  (12 档 regime 决策矩阵, 第一命中)")
     print("| regime | 触发条件 | action_type | LLM 软决策空间 |")
     print("|---|---|---|---|")
     print( "| MARKET_CLOSED    | 非交易日 / >=15:00                                   "
            "| NO_OP            | 不挂单, 仅汇总观察 |")
     print(f"| CLOSE_RUSH       | 交易日 14:55-15:00                                  "
           f"| SELL_AT_CURRENT  | 单档卖现价, 全部 avail |")
-    print(f"| DEEP_LOSS        | profit_pct ≤ {T['DEEP_LOSS_PCT']}%                   "
+    print(f"| RANGE_BOTTOM     | profit ≤ {T['DEEP_LOSS_PCT']}% 但 20日箱体底部未破     "
+          f"  (span≥{T['RANGE_BOTTOM_SPAN_MIN']}%, 碰底≥{T['RANGE_BOTTOM_TOUCHES_MIN']}次, 碰顶≥{T['RANGE_BOTTOM_TOUCHES_MIN']}次) |"
+          f"| LOW_BUY_ONLY     | 箱底做T: 在底部区间低吸, 反弹至箱体中/上沿卖; "
+          f"只有当放量+主力流出确认破箱底才升级 DEEP_LOSS |")
+    print(f"| DEEP_LOSS        | profit_pct ≤ {T['DEEP_LOSS_PCT']}% (且无箱体保护, 或箱体已破) "
           f"| SELL_ALL         | 单档卖 bid1, 全部 avail |")
     print(f"| TAIL_EXIT        | 14:30+ & profit<0 & MA5≠up                          "
           f"| SELL_AT_CURRENT  | 单档卖现价, 全部 avail |")
@@ -9993,6 +10419,42 @@ def _render_phase1_task():
     print("S0. 【宏观背景】先读上方 [MACRO_SENTIMENT] 情绪得分和信号：")
     print("    - 若宏观偏空 (🔴 ≤-1): LOW_DIP 买入暂缓或不执行, 止损收紧; 优先观望等利空消化")
     print("    - 若宏观偏多 (🟢 ≥+1): 可以正常甚至略激进; 中性 (🟡) → 按默认策略")
+    print("S0.5. 【大盘资金面】读 [MARKET_FLOW] 和 [HOLDINGS_FLOW], 判断资金整体方向:")
+    print("    - 大盘普涨+持仓整体流入 → 做T 卖出端可略激进, 挂箱体上沿")
+    print("    - 大盘普跌+持仓整体流出 → 做T 买入端需等缩量企稳, 不要急于抄底")
+    print("    - 指数分化+个股逆势流入 → 独立行情, 按个股箱体单独分析")
+    print("S0.6. 【多窗口箱体分析】看 [HOLDINGS_DATA] 的 5d/10d/20d 箱体和主力流方向:")
+    print("    对每只 RANGE_BOTTOM 或利润为负的持仓, 按以下框架做概率估计:")
+    print()
+    print("    ┌─ 三场景概率分析框架 ─────────────────────┐")
+    print("    │ 看涨场景 (Bull): 概率 _% → 目标 _元         │")
+    print("    │   触发条件: 主力净流入>0 + 箱底触及 + 缩量   │")
+    print("    │ 基准场景 (Base): 概率 _% → 区间 _~_元        │")
+    print("    │   触发条件: 资金中性 + 箱体内继续震荡         │")
+    print("    │ 看跌场景 (Bear): 概率 _% → 止损 _元          │")
+    print("    │   触发条件: 主力持续流出 + 放量破箱底         │")
+    print("    └───────────────────────────────────────────┘")
+    print()
+    print("    概率赋值指南:")
+    print("    - 主力资金方向: 流入=+15%信心, 流出=-15%信心")
+    print("    - 箱体位确认: 碰箱底≥2次=+10%, 箱底支撑验证=+10%")
+    print("    - 量比信号: 缩量(<0.8)=箱底企稳+10%, 放量(>1.5)=加速-15%")
+    print("    - MA5 方向: 走平=+5%, 向下=-10%, 向上=+15%")
+    print("    - 大盘环境: 普涨=+10%买端信心, 普跌=+10%破位风险")
+    print("    - 箱体跨度: span>5%=做T空间充足+10%, span<3%=费后无利-20%")
+    print("    - 综合概率 = 50%基础 + Σ上述权重 → 输出 Bull/Base/Bear 各多少%")
+    print()
+    print("    【做T 决策模板】当 regime=RANGE_BOTTOM 且综合概率 Bull+Base > 60%:")
+    print("    ① 箱体区间: [5d/10d 最近有效箱体 低-高], 当前位置%")
+    print("    ② 建议买入区: 箱底 ~ 箱底+ATR*1.0 (用更窄的10d/5d箱体而非20d!)")
+    print("    ③ 建议卖出区: 箱体中位 ~ 箱体上沿 (或最近阻力位)")
+    print("    ④ 破位止损: 箱底-2% (真破位确认线)")
+    print("    ⑤ 概率判断: Bull _% / Base _% / Bear _%, 做T置信度=高/中/低")
+    print("    ⑥ 资金面: 主力净流入 _万, 方向确认度=强/弱/无数据")
+    print("    若 Bear > 40% → 建议放弃做T, 考虑减仓防御")
+    print()
+    print("    【注意】当 5d 箱体远窄于 20d 箱体 (如 5d=3% 而 20d=17%), 说明")
+    print("    近期已收敛到窄幅区间, 用 5d/10d 箱体做T 而非过时的 20d 箱体!")
     print("S1. 【默认采纳】逐只看 [REGIME_CLASSIFY] 的 `默认建议 --order` 列，如无特殊看法 → 原样拼到 Phase 2 调用。")
     print("S2. 【可选微调】参考 [HOLDINGS_DATA] 主力流入 + 量比5d:")
     print("    - 强 (流入>0 & 量比≥1.5) → sell pct 偏软区间 hi 端; 弱 → 偏 lo 端;")
@@ -10060,6 +10522,7 @@ def _validate_one_order(order):
 
 
 # Action-type ↔ side compatibility (B1: symmetric guard).
+# RANGE_BOTTOM uses LOW_BUY_ONLY action_type — buy-only near bottom of range.
 _BUY_OK_ATYPES = {"RANGE_BOTH", "RANGE_BOTH_TIGHT", "LOW_BUY_ONLY"}
 _SELL_OK_ATYPES = {
     "SELL_AT_CURRENT", "SELL_ALL", "PARTIAL_SELL", "SELL_AT_HIGH",
@@ -10067,7 +10530,7 @@ _SELL_OK_ATYPES = {
 }
 # Regimes where price_pct MUST be used (price_type forbidden) — they have a
 # soft pct range LLM has to soft-pick within.
-_RANGE_REGIMES = {"OSC_LARGE", "OSC_SMALL", "TREND_UP", "HIGH_BAND", "LOW_DIP", "BREAKOUT_ADD"}
+_RANGE_REGIMES = {"OSC_LARGE", "OSC_SMALL", "TREND_UP", "HIGH_BAND", "LOW_DIP", "BREAKOUT_ADD", "RANGE_BOTTOM"}
 # Regime override whitelist (B2): LLM may only force into these defensive
 # regimes. NO_OP-class means "give up" → orders MUST be []. Sell-class means
 # "escalate to full exit" → orders must be sell-only with price_type=current
@@ -10701,7 +11164,9 @@ def sell_plan(holdings, target_yuan=10000.0, orders_list=None,
     print(sep)
     _render_state_block(now, sess_meta, target_yuan, len(rows), fee_floor_pct)
     _render_macro_sentiment()
+    _render_market_flow()
     _render_holdings_data(rows)
+    _render_holdings_flow(rows)
 
     if is_phase2:
         _validate_and_render_phase2(rows, orders_list or [],
