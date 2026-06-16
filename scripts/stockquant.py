@@ -5637,20 +5637,31 @@ def screen_strategy_e(box_days=60, box_range_max_pct=25.0,
 # ==========================================================================
 
 def screen_strategy_f1(min_amount=50_000_000,
-                       max_10d_pct=3.0, min_10d_pct=-3.0,
-                       max_60d_amplitude_pct=25.0,
-                       today_pct_min=1.0, today_pct_max=4.0,
-                       today_vr_min=1.2, today_vr_max=2.5,
-                       require_above_ma20=True,
+                       min_60d_drawdown_pct=25.0,
+                       max_5d_amplitude_pct=3.5,
+                       max_5d_vol_vs_20d=0.7,
+                       max_ma20_distance_pct=5.0,
+                       today_pct_min=1.0, today_pct_max=5.0,
+                       today_vr_min=1.2, today_vr_max=3.0,
                        market="all", sample=None):
-    """Strategy F1: low-vol consolidation + first breakout day.
+    """Strategy F1: post-correction bottom reversal.
+
+    Captures stocks that have experienced meaningful prior correction
+    (60d drawdown >= 25%), entered a bottoming phase (no new lows, range
+    contracting, volume drying up), and today produced a moderate breakout
+    candle near MA20. This is the "dull-knife bottom-fishing" strategy --
+    wait for the bleeding to stop, then enter on the first recovery candle.
 
     Returns candidate dicts (strategy='F1').
     """
     drops = {"wrong_market": 0, "st_risky": 0, "thin_liquidity": 0,
              "weak_pct_today": 0, "vol_out_of_band": 0,
-             "no_kline": 0, "10d_not_consolidating": 0,
-             "amplitude_too_wide": 0, "below_ma20": 0}
+             "no_kline": 0,
+             "no_significant_drawdown": 0,
+             "still_making_lows": 0,
+             "amplitude_not_contracting": 0,
+             "volume_not_drying_up": 0,
+             "not_near_ma20": 0}
 
     universe = get_market_list()
     if not universe:
@@ -5694,55 +5705,130 @@ def screen_strategy_f1(min_amount=50_000_000,
         stage1 = stage1[:sample]
 
     # Stage 2: kline-based checks. F1 needs at least 25 days for the
-    # consolidation window + MA20.
+    # drawdown window + bottoming confirmation + MA20.
     codes = [r["code"] for r in stage1]
-    kl_map = get_daily_klines_batch(codes, n=30, workers=8)
+    kl_map = get_daily_klines_batch(codes, n=65, workers=8)
 
     out = []
     for r in stage1:
         code = r["code"]
         kl = kl_map.get(code) or []
-        if len(kl) < 20:
+        if len(kl) < 25:
             drops["no_kline"] += 1
             continue
         closes = [k["close"] for k in kl]
         highs = [k["high"] for k in kl]
         lows = [k["low"] for k in kl]
-        # 10-day cumulative pct (today's close vs 10 days ago).
-        # Note: kl[-1] is today, kl[-11] is 10 days ago.
+        volumes = [k.get("volume") or 0 for k in kl]
+        # === NEW: 60-day drawdown check (replaces amplitude check) ===
+        # Require meaningful prior correction: peak-to-trough >= threshold.
+        wnd_closes = closes[-60:] if len(closes) >= 60 else closes
+        if wnd_closes:
+            peak_60 = max(wnd_closes)
+            trough_60 = min(wnd_closes)
+            drawdown_60 = (peak_60 - trough_60) / peak_60 * 100 if peak_60 > 0 else 0
+            if drawdown_60 < min_60d_drawdown_pct:
+                drops["no_significant_drawdown"] += 1
+                continue
+        else:
+            drawdown_60 = None
+
+        # === NEW: bottoming confirmation ===
+        # A) No new lows: 5-day lowest must be >= 10-day lowest.
+        if len(lows) >= 10:
+            low_5d = min(lows[-5:])
+            low_10d = min(lows[-10:])
+            if low_5d < low_10d:
+                drops["still_making_lows"] += 1
+                continue
+
+        # B) Range contraction: 5-day average daily amplitude <= threshold.
+        if len(highs) >= 5 and len(lows) >= 5:
+            amps_5d = []
+            for i in range(-5, 0):
+                if lows[i] > 0:
+                    amps_5d.append((highs[i] - lows[i]) / lows[i] * 100)
+            avg_amp_5d = sum(amps_5d) / len(amps_5d) if amps_5d else 0
+            if avg_amp_5d > max_5d_amplitude_pct:
+                drops["amplitude_not_contracting"] += 1
+                continue
+        else:
+            avg_amp_5d = None
+
+        # C) Volume drying: 5-day avg volume <= threshold * 20-day avg volume.
+        if len(volumes) >= 20:
+            avg_vol_5d = sum(volumes[-5:]) / 5
+            avg_vol_20d = sum(volumes[-20:]) / 20
+            vol_ratio_5v20 = avg_vol_5d / avg_vol_20d if avg_vol_20d > 0 else None
+            if vol_ratio_5v20 is not None and vol_ratio_5v20 > max_5d_vol_vs_20d:
+                drops["volume_not_drying_up"] += 1
+                continue
+        else:
+            avg_vol_5d = avg_vol_20d = vol_ratio_5v20 = None
+
+        # === MODIFIED: near MA20 (was "above MA20") ===
+        # After a deep correction, MA20 is still declining. Require close
+        # within the band instead of strictly above.
+        ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+        if ma20 is not None and closes[-1] > 0:
+            from_ma20 = abs(closes[-1] - ma20) / ma20 * 100
+            if from_ma20 > max_ma20_distance_pct:
+                drops["not_near_ma20"] += 1
+                continue
+        ma40 = sum(closes[-40:]) / 40 if len(closes) >= 40 else None
+        ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+        # 10-day cumulative pct (for display / pattern matching, not a hard gate).
         if len(closes) >= 11 and closes[-11] > 0:
             cum10 = (closes[-1] - closes[-11]) / closes[-11] * 100
         else:
             cum10 = None
-        if cum10 is None or cum10 > max_10d_pct or cum10 < min_10d_pct:
-            drops["10d_not_consolidating"] += 1
-            continue
-        # 60-day price amplitude: (max - min) / min * 100, capped to
-        # screen out wide-swinging volatile names.
-        wnd = closes[-60:] if len(closes) >= 60 else closes
-        if wnd:
-            lo, hi = min(wnd), max(wnd)
-            amp = (hi - lo) / lo * 100 if lo > 0 else 0
-            if amp > max_60d_amplitude_pct:
-                drops["amplitude_too_wide"] += 1
-                continue
-        else:
-            amp = None
-        # MA20: today's close must be above MA20.
-        ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
-        if require_above_ma20:
-            if ma20 is None or closes[-1] < ma20:
-                drops["below_ma20"] += 1
-                continue
-        ma40 = sum(closes[-40:]) / 40 if len(closes) >= 40 else None
-        ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
-        # 5-day pct from kline so evidence_card / pattern_match have it.
-        # Without this F1 evidence cards always print "缺 5日涨幅数据"
-        # because EM clist's f109 isn't merged into the F1 stage1 dict.
+        # 5-day cumulative pct (for display / pattern matching).
         if len(closes) >= 6 and closes[-6] > 0:
             cum5 = round((closes[-1] - closes[-6]) / closes[-6] * 100, 2)
         else:
             cum5 = None
+        # === NEW: launch_quality — is this tentative or confirmed? ===
+        launch_pct = r.get("pct") or 0
+        launch_vr = r.get("volume_ratio") or 0
+        # Pct score: 0=weak 1=mild 2=strong
+        if launch_pct >= 3.5:
+            pct_score = 2
+        elif launch_pct >= 2.0:
+            pct_score = 1
+        else:
+            pct_score = 0
+        # VR score
+        if launch_vr >= 2.0:
+            vr_score = 2
+        elif launch_vr >= 1.5:
+            vr_score = 1
+        else:
+            vr_score = 0
+        # MA20 score
+        if ma20 is not None and closes[-1] >= ma20:
+            ma_score = 2
+        elif ma20 is not None and closes[-1] >= ma20 * 0.97:
+            ma_score = 1
+        else:
+            ma_score = 0
+        # 10-day high breakout score
+        if len(highs) >= 10:
+            hi_10d = max(highs[-10:])
+            if closes[-1] >= hi_10d:
+                hi_score = 2
+            elif closes[-1] >= hi_10d * 0.98:
+                hi_score = 1
+            else:
+                hi_score = 0
+        else:
+            hi_score = 0
+        total_launch = pct_score + vr_score + ma_score + hi_score
+        if total_launch >= 6:
+            launch_quality = "strong_reversal"
+        elif total_launch >= 3:
+            launch_quality = "mild_breakout"
+        else:
+            launch_quality = "tentative_recovery"
         out.append({
             "code": code,
             "name": r.get("name"),
@@ -5755,11 +5841,17 @@ def screen_strategy_f1(min_amount=50_000_000,
             "industry": r.get("industry"),
             "main_inflow": r.get("main_inflow"),
             "pct_5d": cum5,
-            "pct_10d": round(cum10, 2),
-            "amplitude_60d_pct": round(amp, 2) if amp is not None else None,
+            "pct_10d": round(cum10, 2) if cum10 is not None else None,
+            "drawdown_60d_pct": round(drawdown_60, 2) if drawdown_60 is not None else None,
+            "amplitude_60d_pct": round(drawdown_60, 2) if drawdown_60 is not None else None,
+            "avg_amp_5d_pct": round(avg_amp_5d, 2) if avg_amp_5d is not None else None,
+            "avg_vol_5v20_ratio": round(vol_ratio_5v20, 2) if vol_ratio_5v20 is not None else None,
+            "volumes": volumes[-5:] if len(volumes) >= 5 else [],
             "ma20": round(ma20, 2) if ma20 else None,
             "ma40": round(ma40, 2) if ma40 else None,
             "ma60": round(ma60, 2) if ma60 else None,
+            "launch_quality": launch_quality,
+            "launch_score": total_launch,
             "strategy": "F1",
             "_source": r.get("_source", "em"),
         })
@@ -6628,8 +6720,8 @@ def _scan_bad_news_for_final(results, days=7, strategies=("C", "D", "E")):
 #   low_vol_consolidation: 10d pct in +-3%, 10d avg volume < 30d avg volume
 #   distribution_top    : 5d pct >=10%, today vol_ratio >=2, pct <2%
 #                         (heavy volume without price follow-through)
-#   breakout_initial    : 10d pct in +-3% consolidation, today pct 1-4%
-#                         with vol_ratio 1.2-2.5 (F1 archetype)
+#   breakout_initial    : post-correction first recovery candle; or classic
+#                         10d pct +-3% + today pct 1-4% + vr 1.2-2.5 (F1)
 #   silent_accumulation : 5d pct in +-3%, main_inflow_5d positive and
 #                         >=0.3% of float MV, not MA-aligned (F2 archetype)
 #   sector_initial_move : own 5d pct small AND sector today_rank in top5
@@ -6706,12 +6798,19 @@ def _match_patterns(c, kl=None):
     if (p5 is not None and p5 >= 10 and vr >= 2.0 and pct < 2):
         out.append("distribution_top")
 
-    # 5. breakout_initial (F1 archetype)
+    # 5. breakout_initial (F1 archetype -- post-correction first breakout candle)
     p10 = c.get("pct_10d")
-    if (p10 is not None and -3 <= p10 <= 3
-            and 1 <= pct <= 4 and 1.2 <= vr <= 2.5
-            and ma20 is not None and price >= ma20):
-        out.append("breakout_initial")
+    dd_60 = c.get("drawdown_60d_pct")  # NEW: F1 now provides this
+    if (p10 is not None and -5 <= p10 <= 5
+            and 1 <= pct <= 6 and 1.2 <= vr <= 3.5
+            and ma20 is not None and price >= ma20 * 0.93):
+        # Also detect via drawdown data when p10 alone doesn't tell the story
+        if dd_60 is not None and dd_60 >= 20:
+            # Major prior correction + recovery candle = strong breakout_initial
+            out.append("breakout_initial")
+        elif -3 <= p10 <= 3 and vr <= 2.5 and price >= ma20:
+            # Classic tight consolidation breakout (original narrow criteria)
+            out.append("breakout_initial")
 
     # 6. silent_accumulation (F2 archetype)
     inflow_ratio = c.get("main_inflow_ratio_pct")
@@ -6760,6 +6859,17 @@ def _build_evidence_card(c, kl=None, market_ctx=None, hot_sectors=None):
     inflow_ratio = c.get("main_inflow_ratio_pct")
     industry = c.get("industry")
     sector_name = c.get("sector_name") or industry
+
+    # --- launch_quality (F1 specific) ---
+    lq = c.get("launch_quality")
+    ls = c.get("launch_score", 0)
+    if lq:
+        if lq == "strong_reversal":
+            bullish.append(f"反转强度: 强反转 (score={ls}/8, 放量+站上MA20+突破前高)")
+        elif lq == "mild_breakout":
+            bullish.append(f"反转强度: 温和突破 (score={ls}/8, 刚开始启动, 待次日确认)")
+        elif lq == "tentative_recovery":
+            uncertain.append(f"反转强度: 试探性企稳 (score={ls}/8, 量价均弱, 可能还需磨底)")
 
     # --- bullish signals ---
     if inflow_ratio is not None and inflow_ratio >= 0.5:
@@ -6922,9 +7032,10 @@ def _build_must_verify_hint(c, kl=None):
     # Strategy-specific checks (universal checks moved to global section in evidence card output)
     if strat == "F1":
         checks.append({
-            "check": "突破真实性",
-            "how": "需要午后收盘价仍站稳今日开盘价+1%以上；"
-                   "若尾盘回到开盘以下 → 放弃 (假突破)",
+            "check": "底部反转真实性",
+            "how": "(1)午后收盘价仍站稳开盘价+1%以上 → 尾盘回落=假突破 "
+                   "(2)今日成交额 > 5日均额的1.5倍 → 真放量 "
+                   "(3)分时图未出现「早盘冲高→全天阴跌」→ 钓鱼走势",
         })
     if strat == "F2":
         checks.append({
@@ -6977,8 +7088,11 @@ def _build_devil_advocate(c, evidence_card):
             "若是 → 不构成吸筹, 只是指数权重股的跟随")
     if strat == "F1":
         questions.append(
-            "『首日突破』的 10 日盘整区间，是否只是前期暴跌后的反弹平台? "
-            "若是 → 实际是弱反弹不是新 leg")
+            "60日回撤是否由个股自身经营恶化造成（非系统性下跌）？"
+            "若是 → 底可能还没到，基本面拐点未现")
+        questions.append(
+            "今日阳线是真金白银买上去的，还是缩量后的随机波动？"
+            "查看5分钟K线分时量：若大部分成交量集中在开盘/尾盘 → 警惕假突破")
     if strat == "F3":
         questions.append(
             "这个板块的异动是消息面驱动吗? 若纯靠某个利好催化 "
@@ -8427,16 +8541,16 @@ def _print_next_step_block(results, meta):
         e_drops = f.get("E_stage1_drops") or {}
         if e_drops:
             print(f"    Stage1 裁掉分布: {dict(e_drops)}")
-        # F1 funnel (low-vol consolidation + first breakout)
+        # F1 funnel (post-correction bottom reversal)
         if "strategy_F1" in f:
             f1_cnt = f.get("strategy_F1", 0)
             f1_review = meta.get("f1_pool_review") or {}
-            print(f"  策略F1（缩量横盘+首日突破）: 通过 {f1_cnt} 只")
+            print(f"  策略F1（大跌回撤+磨底反转）: 通过 {f1_cnt} 只")
             if f1_review:
                 uni = f1_review.get("universe", 0)
                 s1 = f1_review.get("after_stage1", 0)
                 print(f"    全市场 {uni} 只 → Stage1(量价+流动性) {s1} 只 → "
-                      f"盘整突破 {f1_cnt} 只")
+                      f"磨底反转 {f1_cnt} 只")
             f1_drops = f.get("F1_stage1_drops") or {}
             if f1_drops:
                 print(f"    Stage1 裁掉分布: {dict(f1_drops)}")
@@ -9064,7 +9178,7 @@ def print_recommend(results, meta, capital, threshold):
         if edr:
             _v_or_print(f"    [E_stage1_drops] {dict(edr)}")
     if "strategy_F1" in f:
-        print(f"- 策略F1（缩量横盘+首日突破）候选：**{f['strategy_F1']}** 只")
+        print(f"- 策略F1（大跌回撤+磨底反转）候选：**{f['strategy_F1']}** 只")
         f1dr = f.get("F1_stage1_drops") or {}
         if f1dr:
             _v_or_print(f"    [F1_stage1_drops] {dict(f1dr)}")
@@ -9114,10 +9228,18 @@ def print_recommend(results, meta, capital, threshold):
             note = (f"箱幅{br}% 位置{bp}%"
                     if br is not None and bp is not None else "-")
         elif strat == "F1":
-            p10 = c.get("pct_10d")
-            amp = c.get("amplitude_60d_pct")
-            note = (f"10日{p10:+.1f}% 60日振幅{amp}%"
-                    if p10 is not None and amp is not None else "-")
+            dd = c.get("drawdown_60d_pct")
+            lq = c.get("launch_quality", "")
+            lq_icon = {"strong_reversal": "🟢", "mild_breakout": "🟡", "tentative_recovery": "⚪"}.get(lq, "")
+            if dd is not None:
+                parts = [f"{lq_icon}{lq}"]
+                parts.append(f"回撤{dd:.0f}%")
+                am5 = c.get("avg_amp_5d_pct")
+                if am5 is not None:
+                    parts.append(f"振幅{am5:.1f}%")
+                note = " ".join(parts)
+            else:
+                note = "-"
         elif strat == "F2":
             in5 = c.get("main_inflow_5d") or 0
             rat = c.get("main_inflow_ratio_pct")
@@ -11869,7 +11991,19 @@ Step D — 动机-行为一致性检验
 - 所有结论必须给依据(引用具体字段 + 数值), 不做无依据的定性判断
 - 用户没明说时间周期就默认"短中期 1-4 周"视角
 - 腹黑分析必须有公告/资金/K线的具体数据支撑，不能纯猜测
-- 对比分析必须用表格呈现，不能大段文字糊过去""")
+- 对比分析必须用表格呈现，不能大段文字糊过去
+
+[自我追问（必做！）]
+在给出最终结论前，必须从以下选 2-3 个最关键的问题自问自答：
+1. "我这个判断最薄弱的环节在哪？如果错了，最可能是什么原因？"
+2. "当前数据中是否有和结论矛盾的信号？这些矛盾被充分解释了吗？"
+3. "未来 1-2 个交易日内，什么数据变化会推翻我的核心判断？"
+4. "如果我是对手盘，我会在哪个价位做什么操作？我的结论和对手盘的利益冲突吗？"
+
+要求：
+- 自问自答必须结合当前具体数据，不能空泛
+- 必须引用 [资金面] / [日K序列] / [15分钟K] / [公告] 中的具体数字
+- 如果某个自我追问暴露了逻辑漏洞，必须修正结论或标注不确定性""")
 
 
 # ==========================================================================
