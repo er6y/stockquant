@@ -2,3 +2,8 @@ cache
 config
 logs
 scripts/__pycache__
+
+# Build/verify helper scripts (not for distribution)
+scripts/_build_full.py
+scripts/_check_kline.py
+scripts/_verify.py
