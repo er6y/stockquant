@@ -99,6 +99,39 @@ _BAD_NEWS_PATTERNS = [
     "失信被执行",
 ]
 
+# ⚠️ CRITICAL EVENT PATTERNS — 命中即触发红色预警，技术面全部失效
+# 这些 KEYWORD 在公告标题中出现时，自动判定为「确定性事件冲击」
+# _CRITICAL_EVENT_PATTERNS 与 _BAD_NEWS_PATTERNS 的区别：
+#   _BAD_NEWS_PATTERNS: 降低置信度，需额外验证，但未必直接排除
+#   _CRITICAL_EVENT_PATTERNS: 确定性短期冲击，命中后直接放弃该股 / 输出红色预警
+_CRITICAL_EVENT_PATTERNS = {
+    # 可转债 (convertible bond) — 申购日/登记日 = 确定性集中抛售
+    "可转债申购": ("🔴 RED", "可转债申购日，抢权资金集中抛售正股，技术面失效"),
+    "可转债发行": ("🔴 RED", "可转债发行期间，正股承压，短期内不建议交易"),
+    "可转债网上": ("🔴 RED", "可转债网上申购，确定性抛压，立即回避"),
+    "可转债上市": ("🟠 ORANGE", "可转债上市日，正股可能受转股套利抛压影响"),
+    "可转换公司债券": ("🔴 RED", "可转债事件，正股短期承压，回避"),
+    "可转债中签": ("🟠 ORANGE", "可转债中签公布，正股抛压减轻但仍有残余"),
+    "公开发行可转债": ("🔴 RED", "可转债发行公告，正股即将面临配债抛售"),
+    # 配股 (rights issue)
+    "配股发行": ("🟠 ORANGE", "配股期间老股东抛旧换新，正股承压"),
+    "配股缴款": ("🔴 RED", "配股缴款期，正股面临集中抛压"),
+    "配股认购": ("🔴 RED", "配股认购期，正股承压"),
+    # 大股东减持 (insider selling)
+    "控股股东减持": ("🔴 RED", "控股股东减持，重大利空，一个月内偏空"),
+    "大股东减持计划": ("🟠 ORANGE", "大股东披露减持计划，中期偏空"),
+    # 限售股解禁 (lockup expiration)
+    "限售股上市流通": ("🟠 ORANGE", "限售股解禁，流通盘扩大，抛压增加"),
+    "限售股解禁提示": ("🟠 ORANGE", "限售股解禁提示，注意抛压"),
+    # 业绩暴雷 (earnings disaster)
+    "业绩预亏": ("🔴 RED", "业绩预亏公告，基本面恶化，回避"),
+    "业绩大幅下滑": ("🔴 RED", "业绩大幅下滑，基本面恶化，回避"),
+    # 退市/ST风险
+    "退市风险警示": ("🔴 RED", "退市风险警示，立即回避，不得交易"),
+    "终止上市": ("🔴 RED", "退市风险，立即回避，不得交易"),
+    "实施风险警示": ("🔴 RED", "ST风险警示，立即回避，不得交易"),
+}
+
 # Major A-share indexes (secid, display name)
 _INDEX_LIST = [
     ("1.000001", "上证指数"),
@@ -4090,6 +4123,228 @@ def has_bad_news(code, days=7, use_cache=True):
             if pat in title:
                 return True, f"[{nd[:10]}] {title[:50]} (命中: {pat})"
     return False, None
+
+
+def check_critical_events(code, days=14, use_cache=True):
+    """Check announcements for CRITICAL events (convertible bonds, etc.).
+
+    Returns (hit: bool, level: str, matched_keyword: str, reason: str)
+      - hit=False: no critical event found
+      - level: "RED" (must avoid) / "ORANGE" (strong caution) / None
+    """
+    key = f"ann_{code}.json"
+    items = None
+    if use_cache:
+        cached = _cache_get(key, ttl_sec=3600)
+        if cached is not None:
+            items = cached
+    if items is None:
+        items = _fetch_announcements(code)
+        _cache_set(key, items)
+    if not items:
+        return False, None, None, None
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    for it in items:
+        nd = it.get("notice_date") or ""
+        try:
+            dt = datetime.datetime.strptime(nd[:10], "%Y-%m-%d")
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+        title = it.get("title", "") or ""
+        for keyword, (level, reason) in _CRITICAL_EVENT_PATTERNS.items():
+            if keyword in title:
+                return True, level, keyword, f"[{nd[:10]}] {title[:60]} | {reason}"
+    return False, None, None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 可转债抢权套利窗口检测 (CB Arbitrage Window Detection)
+# ═══════════════════════════════════════════════════════════════════════
+# 回测规律：T-10到T日累计+3.85%, T-1日单日+2.07%, T+1日-1.70%
+# 公告模式：发行公告→(1-2天)→股权登记日→(1天)→申购日
+
+_CB_PHASE_PATTERNS = {
+    "issue_announced": [
+        "可转换公司债券发行公告",
+        "公开发行可转换公司债券发行公告",
+    ],
+    "roadshow": [
+        "可转换公司债券网上路演",
+        "可转债网上路演",
+    ],
+    "subscription_tip": [
+        "可转换公司债券发行提示性公告",
+        "可转债发行提示性公告",
+    ],
+    "credit_rating": [
+        "可转换公司债券信用评级",
+    ],
+    "prospectus": [
+        "可转换公司债券募集说明书",
+        "可转换公司债券募集说明书摘要",
+    ],
+}
+
+
+def check_cb_arbitrage_window(code, use_cache=True):
+    """Detect convertible bond arbitrage window from announcements.
+
+    Returns dict or None:
+      None: no CB event found
+      {
+        "phase": "LATENT" | "RUSH" | "RECORD_DAY" | "SUBSCRIPTION" | "POST_SUB",
+        "phase_label": human-readable phase description,
+        "action": suggested trading action,
+        "action_color": "🟢" | "🟡" | "🔴" | "⚪",
+        "ann_date": date of the key CB announcement,
+        "est_record_date": estimated record date,
+        "est_sub_date": estimated subscription date,
+        "confirm_level": "LOW" | "MED" | "HIGH",
+        "detail": explanation string,
+        "suggested_entry": suggested entry price/timing hint,
+        "suggested_exit": suggested exit timing,
+      }
+    """
+    key = f"ann_{code}.json"
+    items = None
+    if use_cache:
+        cached = _cache_get(key, ttl_sec=3600)
+        if cached is not None:
+            items = cached
+    if items is None:
+        items = _fetch_announcements(code)
+        _cache_set(key, items)
+    if not items:
+        return None
+
+    today = datetime.datetime.now()
+    cutoff = today - datetime.timedelta(days=14)
+
+    # Scan announcements for CB patterns, record earliest and latest dates
+    cb_anns = []
+    for it in items:
+        nd = it.get("notice_date") or ""
+        try:
+            dt = datetime.datetime.strptime(nd[:10], "%Y-%m-%d")
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+        title = it.get("title", "") or ""
+        for phase, patterns in _CB_PHASE_PATTERNS.items():
+            for pat in patterns:
+                if pat in title:
+                    cb_anns.append({
+                        "phase": phase,
+                        "date": dt,
+                        "date_str": nd[:10],
+                        "title": title[:80],
+                    })
+                    break
+            else:
+                continue
+            break
+
+    if not cb_anns:
+        return None
+
+    # Classify current phase based on the most recent CB announcement
+    latest = max(cb_anns, key=lambda x: x["date"])
+    earliest = min(cb_anns, key=lambda x: x["date"])
+
+    # Estimate key dates
+    issue_anns = [a for a in cb_anns if a["phase"] == "issue_announced"]
+    sub_tip_anns = [a for a in cb_anns if a["phase"] == "subscription_tip"]
+    roadshow_anns = [a for a in cb_anns if a["phase"] == "roadshow"]
+
+    if issue_anns:
+        issue_date = min(a["date"] for a in issue_anns)
+    else:
+        issue_date = earliest["date"]
+
+    est_record_date = issue_date + datetime.timedelta(days=1)  # usually T-1公告, T登记
+    est_sub_date = est_record_date + datetime.timedelta(days=1)
+
+    days_since_issue = (today - issue_date).days
+    days_to_sub = (est_sub_date - today).days
+
+    # Determine phase
+    if sub_tip_anns:
+        sub_tip_date = min(a["date"] for a in sub_tip_anns)
+        if today.date() == sub_tip_date.date():
+            phase = "SUBSCRIPTION"
+            phase_label = "🔴 申购日（今天）"
+            action = "⛔ 确定性抛压日：申购资金集中抛售正股，禁止买入/加仓，持仓者立即考虑卖出避险"
+            action_color = "🔴"
+            confirm_level = "HIGH"
+            suggested_entry = None
+            suggested_exit = "今天立即卖出（开盘竞价或盘中反弹），每股跌幅通常5-10%"
+        elif today.date() > sub_tip_date.date():
+            phase = "POST_SUB"
+            phase_label = "⚪ 申购日后"
+            action = "🔴 抛压消化期：正股仍在吸抛压，观望不参与，等转债上市后重新评估"
+            action_color = "⚪"
+            confirm_level = "HIGH"
+            suggested_entry = None
+            suggested_exit = "如有持仓且未卖，反弹减仓"
+        else:
+            phase = "RUSH"
+            phase_label = "🟡 抢权加速期"
+            action = "🟢 临近申购日，抢权资金正在推高股价，可在登记日前买入、登记日卖出"
+            action_color = "🟡"
+            confirm_level = "MED"
+            suggested_entry = f"{est_record_date.strftime('%m/%d')}前买入"
+            suggested_exit = f"{est_record_date.strftime('%m/%d')}（登记日）尾盘卖出或最晚{est_sub_date.strftime('%m/%d')}开盘卖出"
+    elif days_since_issue <= 3:
+        phase = "LATENT"
+        phase_label = "🟢 潜伏窗口"
+        action = f"🟢 可转债发行公告已出，历史数据显示公告日至登记日正股平均涨幅+3~5%。建议在登记日({est_record_date.strftime('%m/%d')})前买入，登记日或最晚{est_sub_date.strftime('%m/%d')}开盘卖出"
+        action_color = "🟢"
+        confirm_level = "MED"
+        suggested_entry = f"当前价位或{est_record_date.strftime('%m/%d')}前回调时买入"
+        suggested_exit = f"{est_record_date.strftime('%m/%d')}（登记日）尾盘卖出，最晚{est_sub_date.strftime('%m/%d')}开盘离场"
+    elif days_since_issue <= 7:
+        # Might be near record date already
+        if days_to_sub <= 0:
+            phase = "SUBSCRIPTION"
+            phase_label = "🔴 申购日或临近"
+            action = "⛔ 申购日确定性抛压，禁止参与，观望等转债上市"
+            action_color = "🔴"
+            confirm_level = "MED"
+            suggested_entry = None
+            suggested_exit = "如有持仓立即卖出"
+        else:
+            phase = "RUSH"
+            phase_label = "🟡 抢权后期"
+            action = "🟡 接近登记日，抢权资金已部分推高股价，空间收窄但仍有机会。注意最晚{est_sub_date}开盘必须离场"
+            action_color = "🟡"
+            confirm_level = "LOW"
+            suggested_entry = None
+            suggested_exit = f"最晚{est_sub_date.strftime('%m/%d')}开盘卖出"
+    else:
+        phase = "POST_SUB"
+        phase_label = "⚪ 发行后"
+        action = "可转债发行流程已过，等转债上市后重新评估正股"
+        action_color = "⚪"
+        confirm_level = "LOW"
+        suggested_entry = None
+        suggested_exit = None
+
+    return {
+        "phase": phase,
+        "phase_label": phase_label,
+        "action": action,
+        "action_color": action_color,
+        "ann_date": issue_date.strftime("%Y-%m-%d"),
+        "est_record_date": est_record_date.strftime("%Y-%m-%d"),
+        "est_sub_date": est_sub_date.strftime("%Y-%m-%d"),
+        "confirm_level": confirm_level,
+        "detail": f"公告日: {issue_date.strftime('%m/%d')} | 预估登记日: {est_record_date.strftime('%m/%d')} | 预估申购日: {est_sub_date.strftime('%m/%d')}",
+        "suggested_entry": suggested_entry,
+        "suggested_exit": suggested_exit,
+    }
 
 
 def is_trading_day_probe():
@@ -9602,11 +9857,15 @@ def _apply_llm_hints(results, market_ctx, top5_sectors, meta,
             if br <= 15 and bp >= 90 and vr >= 2:
                 boost.append("tight_box_breakout")
 
-        # ---------- SOFT warn: news ----------
+        # ---------- Event check: CRITICAL events → hard reject, bad news → soft warn ----------
         if bad_news_map is not None:
             hit = bad_news_map.get(c.get("code"))
             if hit:
-                warn.append(f"bad_news:{hit[:30]}")
+                if "⛔ CRITICAL:" in hit:
+                    # 确定性事件冲击（可转债申购日等）→ 直接 reject
+                    reject.append(f"critical_event:{hit[:60]}")
+                else:
+                    warn.append(f"bad_news:{hit[:30]}")
 
         # ---------- SOFT warn: sector rotation ----------
         industry = (c.get("industry") or "").strip()
@@ -9654,21 +9913,35 @@ def _scan_bad_news_for_final(results, days=7, strategies=("C", "D", "E")):
     """Scan announcement bad-news titles for final candidates.
 
     Strategies C/D/E all hold overnight so announcement risk applies
-    uniformly. Returns {code: matched_title}. Fail-safe: any error
-    returns empty dict (cache layer handles transient flakiness).
+    uniformly. Returns {code: matched_title}.
+    Also checks critical events (convertible bonds, etc.) and returns
+    {code: "CRITICAL: reason"} for RED-level events.
+    Also collects CB arbitrage windows as cb_arb = {code: cb_info}.
+    Fail-safe: any error returns empty dict (cache layer handles transient flakiness).
     """
     result = {}
+    cb_arb = {}
     codes = [c.get("code") for c in results
              if c.get("strategy") in strategies and c.get("code")]
     for code in codes:
         try:
-            bad, hit = has_bad_news(code, days=days)
-            if bad and hit:
-                result[code] = hit
+            # 先检查可转债套利窗口
+            cb_info = check_cb_arbitrage_window(code)
+            if cb_info and cb_info.get("phase") in ("LATENT", "RUSH"):
+                cb_arb[code] = cb_info
+            # 再检查确定性事件（可转债申购日等），命中 RED = 直接标记
+            hit, level, keyword, reason = check_critical_events(code, days=14)
+            if hit and "RED" in (level or ""):
+                result[code] = f"⛔ CRITICAL: {reason}"
+                continue
+            # 再检查常规负面新闻
+            bad, hit_title = has_bad_news(code, days=days)
+            if bad and hit_title:
+                result[code] = hit_title
         except Exception as e:
             # Silently skip per-code failure; announcement API is flaky.
             print(f"WARN: bad-news scan failed for {code}: {type(e).__name__}", file=sys.stderr)
-    return result
+    return result, cb_arb
 
 
 # ==========================================================================
@@ -10568,12 +10841,14 @@ def recommend(capital=10000, market="all",
     # 6. LLM hints layer (reject/warn/boost tags + next_day_prob bucket)
     top5_sectors = top5_sectors_cached
     bad_news_map = None
+    cb_arb_map = {}
     if check_bad_news and final:
         try:
-            bad_news_map = _scan_bad_news_for_final(final, days=7)
+            bad_news_map, cb_arb_map = _scan_bad_news_for_final(final, days=7)
         except Exception as e:
             print(f"WARN: bad-news scan failed: {e}", file=sys.stderr)
             bad_news_map = {}
+    meta["cb_arbitrage"] = cb_arb_map
 
     _apply_llm_hints(final, market_ctx, top5_sectors, meta,
                      bad_news_map=bad_news_map)
@@ -14871,6 +15146,53 @@ def analyze(queries, include_news=True, days=120, minutes=32,
                     print(f"- ⚠️ 7 日内负面标题命中: {matched}")
                 else:
                     print("- ✅ 7 日内无负面新闻命中")
+            except Exception:
+                pass
+            # ⛔ CRITICAL EVENT CHECK — 命中则直接输出红色大横幅
+            try:
+                hit, level, keyword, reason = check_critical_events(code, days=14)
+                if hit:
+                    print()
+                    if "RED" in (level or ""):
+                        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        print("⛔⛔⛔  【红色预警·确定性事件冲击】技术面全部分析无效！⛔⛔⛔")
+                        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        print(f"  命中关键词: {keyword}")
+                        print(f"  详情: {reason}")
+                        print(f"  结论: 该股存在确定性短期利空，所有技术面买入信号无效")
+                        print(f"  建议: ⛔ 不买入 / 不推荐 / 持仓者考虑减仓避险")
+                        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        print()
+                        print("⛔ 事件冲击 > 技术面，请不要引用下方技术数据做多该股。⛔")
+                        print()
+                    else:
+                        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        print("🟠 【橙色预警·事件提醒】技术面需降权处理")
+                        print(f"  命中关键词: {keyword}")
+                        print(f"  详情: {reason}")
+                        print(f"  结论: 该股近期有事件冲击，所有技术面买入信号需额外验证")
+                        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        print()
+            except Exception:
+                pass
+            # 🟢 可转债抢权套利窗口检测
+            try:
+                cb = check_cb_arbitrage_window(code)
+                if cb and cb.get("phase") in ("LATENT", "RUSH", "SUBSCRIPTION"):
+                    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                    print(f"💰 【可转债抢权套利窗口】{cb['phase_label']}")
+                    print(f"  阶段: {cb['phase']}")
+                    print(f"  置信度: {cb['confirm_level']}")
+                    print(f"  关键日期: {cb['detail']}")
+                    if cb.get("suggested_entry"):
+                        print(f"  建议买入时机: {cb['suggested_entry']}")
+                    if cb.get("suggested_exit"):
+                        print(f"  建议卖出时机: {cb['suggested_exit']}")
+                    print(f"  操作: {cb['action']}")
+                    print("  参考: 历史回测122只转债，公告日至登记日正股平均累计涨+3.85%")
+                    print("        T-1日单日涨幅最大(+2.07%)，T+1日申购日平均跌-1.70%")
+                    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                    print()
             except Exception:
                 pass
             print()
