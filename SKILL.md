@@ -44,7 +44,7 @@ A 股一站式：**选股 / 持仓策略 / 个股分析**。Python 只出**数�
 ### 1. 选股（PICK_BUY）
 
 ```sh
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py recommend --capital <元> --market all --top 8
+python scripts/stockquant.py recommend --capital <元> --market all --top 8
 ```
 
 默认同跑 **C / F1 / F2 / F3**（不含 D、E）。读输出 `═══ ## NEXT_STEP ═══`：`[STATE] / [DATA] / [TASK]`，按 `[TASK]` S1~S6 执行。状态位 `should_terminate` / `session_not_for_entry` 命中即 terminate，不入场。**重点读 `## 证据卡 / 形态 / 置信度` 章节**，不要只看 Top-N 表。
@@ -182,7 +182,7 @@ python ${SKILL_DIR}/stockquant/scripts/stockquant.py recommend --capital <元> -
 > 5. 如果调整系数极端但技术面强烈相反，**优先采信宏观方向，但保留技术面作为反证**（如"虽然宏观偏空但个股出现异常放量逆势 + 大单流入，需观察"）——此条在红警下仅在"技术面反证极度异常"时生效
 
 ```sh
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py sell-plan \
+python scripts/stockquant.py sell-plan \
   <code>:<qty>/<avail>@<cost> [...]
 # 例：sell-plan 000949:1200/800@7.97 002324:500/500@17.11
 ```
@@ -205,11 +205,48 @@ python ${SKILL_DIR}/stockquant/scripts/stockquant.py sell-plan \
 
 > **数据维度 / 解读框架 / 常见用户意图回答套路** 见 `README.md` §个股分析（ANALYZE）。
 
+### 3.5 港股标的（5 位代码）—— 强制筹码披露（HK-CHECK）
+
+> ✅ `analyze` 已支持港股：5 位代码或港股名称自动分流到港股管线
+> （基本/今日行情/日K采样/公告/筹码风险披露，与 A 股同构；无 A 股口径主力
+> 资金与板块排名，15分钟K 视数据源而定，日K源价格口径有缩放差、绝对价位以
+> [今日行情] 为准）。筹码深查仍用 `hk-check <代码>`（四项清单+腹黑钩子）。
+
+港股薄流通盘（流通盘常 <3%）的日内波动主要由**筹码结构**驱动而非消息面，任何买卖结论前必须先跑渐进式披露：
+
+```sh
+python scripts/stockquant.py hk-check <代码> [--days 120]
+```
+
+输出**四项筹码清单**（缺一不得下结论）：
+1. **配售/增发**：公告自动扫描命中即列出——配售价 = 价格引力位 / 头顶抛压，反弹至配售价上方易遭翻本盘卖出；公告未含的历史配售价需人工补充
+2. **解禁**：港股无统一公告口径——需人工核对招股书基石/控股股东锁定到期日
+3. **可转债**：转股价之上 = 悬顶抛压，注意到期/强赎条款
+4. **南向/事件日历**：港股通假期（国庆/春节周）= 南向缺席流动性真空；FOMC/PCE = 折现率重定价；业绩/ARR 披露 = 波动放大点
+
+已知事实锚点（2026-09 快照，以 hk-check 重新扫描为准）：智谱 02513 = 9/13 配售价 **714** + 9/18 完成配售与 201.4 亿人民币零息 CB（2027 到期）+ 7 月已配售一次；MiniMax 00100 = 7 月配售价 **268**（3560 万股）+ 65 亿港元零息 CB（2027 到期）。
+
+**⚡ 调用纪律（2026-09-22 事故后钉死）**：用户问任何港股"能不能买/要不要卖"时，**第一跳必须是 hk-check**（渐进式披露：筹码先于行情、先于网搜），命中项直接喂给腹黑分析 Step A（配售承配人/转债持有人/解禁股东=必入图谱的利益方）和 Step D（动机-行为一致性：折价发行+持续摊薄的公司，信行为不信叙事）。网搜只补披露之外的传闻与情绪，不能替代披露。
+
+### 3.6 港股分钟级行情（hk-intraday）—— 5 分钟交易循环数据源
+
+```sh
+python scripts/stockquant.py hk-intraday <代码> [...] [--klt 5] [--n 48]
+# 例：python scripts/stockquant.py hk-intraday 02513 00100 --klt 5 --n 48
+```
+
+每只标的一屏输出（约 3s）：`[QUOTE]` 实时行情、`[HINT]` 预计算指标矩阵
+（今日 MA5/10/20、VWAP、日内位置%、尾 bar 量比、30m/60m 动量%）、
+`[BARS]` 最近 N 根分钟 K（**最后一根为正在形成的未完成 bar**，决策用收盘价
+时优先取倒数第二根）。数据源 EM push2his（secid=116.xxxxx，fqt=0）；
+`analyze_hk` 的 15 分钟 K 段自本版本起同样走此通道（不再恒为空）。
+配套记账工具见工作区 `模拟炒股/ledger.py`（费用去皮账本）。
+
 ### 4. Tushare Token 管理（按需调用，见 HINT 指令）
 
 ```sh
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py tushare-token --set <TOKEN>
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py tushare-token --skip
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py tushare-token --status
-python ${SKILL_DIR}/stockquant/scripts/stockquant.py tushare-token --clear
+python scripts/stockquant.py tushare-token --set <TOKEN>
+python scripts/stockquant.py tushare-token --skip
+python scripts/stockquant.py tushare-token --status
+python scripts/stockquant.py tushare-token --clear
 ```

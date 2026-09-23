@@ -117,6 +117,14 @@ _CRITICAL_EVENT_PATTERNS = {
     "配股发行": ("🟠 ORANGE", "配股期间老股东抛旧换新，正股承压"),
     "配股缴款": ("🔴 RED", "配股缴款期，正股面临集中抛压"),
     "配股认购": ("🔴 RED", "配股认购期，正股承压"),
+    # 增发/定增 (seasoned offering) — 折价发行=摊薄+未来解禁悬顶
+    "非公开发行": ("🟠 ORANGE", "定增/非公开发行：折价摊薄+限售到期悬顶，腹黑分析必查发行对象与折价率"),
+    "定向增发": ("🟠 ORANGE", "定增事件：核查发行价与现价距离，低价定增盘=潜在抛压"),
+    "增发新股": ("🟠 ORANGE", "增发摊薄，核查发行价"),
+    # 并购/重组/要约 — 2026-09-22 恒尚/爱丽/艾艾剧本的引擎化
+    "重大资产重组": ("🟠 ORANGE", "重大资产重组：波动放大，腹黑分析 Step A/D 必须运行（谁是受益者）"),
+    "并购重组": ("🟠 ORANGE", "并购重组事件：题材与抛压并存，核查业绩承诺与约束性协议"),
+    "要约收购": ("🟠 ORANGE", "要约收购/控制权变更博弈：核查要约价与现价距离"),
     # 大股东减持 (insider selling)
     "控股股东减持": ("🔴 RED", "控股股东减持，重大利空，一个月内偏空"),
     "大股东减持计划": ("🟠 ORANGE", "大股东披露减持计划，中期偏空"),
@@ -3987,11 +3995,21 @@ def _build_default_a_share_codes():
     return codes
 
 
+def _is_hk_code(code: str) -> bool:
+    """Hong Kong 5-digit code (e.g. 00100 MINIMAX-W, 02513 智谱)."""
+    c = (code or "").strip()
+    return c.isdigit() and len(c) == 5
+
+
 def _fetch_em_announcements(code, page_size=20):
-    """Primary source: East Money np-anotice-stock (no key required)."""
+    """Primary source: East Money np-anotice-stock (no key required).
+    A-shares use ann_type=A; Hong Kong 5-digit codes use ann_type=H,
+    which returns HKEX filings (placements / CBs / monthly returns /
+    results) -- the raw material for the overhang (筹码风险) scan."""
+    ann_kind = "H" if _is_hk_code(code) else "A"
     url = (
         f"https://np-anotice-stock.eastmoney.com/api/security/ann?"
-        f"page_index=1&page_size={page_size}&ann_type=A&sr=-1"
+        f"page_index=1&page_size={page_size}&ann_type={ann_kind}&sr=-1"
         f"&stock_list={code}&client_source=web"
     )
     try:
@@ -4091,6 +4109,114 @@ def _fetch_announcements(code, page_size=20):
         print(f"INFO: announcements for {code}: EM empty, cninfo fallback "
               f"yielded {len(alt)} entries", file=sys.stderr)
     return alt
+
+
+# --------------------------------------------------------------------------
+# HK overhang disclosure (筹码风险四项清单) -- 2026-09-22 智谱 714 配售事故后
+# 新增强制披露环节。港股薄流通盘 (流通盘常 <3%) 的日内波动主要由筹码结构驱动：
+# 配售价是价格引力位/头顶抛压，解禁与可转债转股是悬顶，南向假期=边际买家缺席。
+# 任何买卖结论前必须先过这张清单。
+# --------------------------------------------------------------------------
+
+_HK_OVERHANG_KEYWORDS = (
+    "配售", "供股", "先旧后新", "可换股债", "可转换债", "可转债",
+    "认购协议", "承配人", "配发", "发行新", "股本",
+    "收购", "合并", "主要交易", "非常重大", "关连交易", "认股权证",
+)
+
+_HK_OVERHANG_NOISE = ("月报表", "翌日披露报表", "董事会会议通知")
+
+
+def _hk_overhang_scan(anns, lookback_days=120):
+    """Scan HK announcements for capital-structure overhang signals
+    (placements / rights issues / CBs). Returns list of (date, title)."""
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=lookback_days)
+    hits = []
+    for a in anns or []:
+        nd = (a.get("notice_date") or "")[:10]
+        title = a.get("title") or ""
+        try:
+            dt = datetime.datetime.strptime(nd, "%Y-%m-%d")
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+        if any(n in title for n in _HK_OVERHANG_NOISE):
+            continue
+        if any(k in title for k in _HK_OVERHANG_KEYWORDS):
+            hits.append((nd, title))
+    return hits
+
+
+def hk_check(code, lookback_days=120):
+    """CLI: 港股筹码风险四项清单披露。渐进式披露环节 -- 结论前必读。"""
+    c = (code or "").strip()
+    if c.upper().endswith(".HK"):
+        c = c[:-3]
+    c = c.zfill(5) if (c.isdigit() and len(c) < 5) else c
+    if not _is_hk_code(c):
+        print(f"❌ '{code}' 不是 5 位港股代码（如 02513 00100）")
+        sys.exit(2)
+
+    print(f"═══ 港股筹码风险披露: {c} ═══")
+
+    # -- 1. 实时行情 (EM push2, secid 116.x) --
+    qt = _quote_em(c) or {}
+    if qt:
+        print("[实时行情]")
+        print(f"- {qt.get('name', c)}  现价 {qt.get('price')}  "
+              f"{qt.get('pct', 0):+.2f}%")
+        print(f"- 开 {qt.get('open')}  高 {qt.get('high')}  低 {qt.get('low')}  "
+              f"昨收 {qt.get('prev_close')}")
+        amt = qt.get("amount") or 0
+        print(f"- 成交额 {amt / 1e8:.1f} 亿  "
+              f"总市值 {(qt.get('total_mv') or 0) / 1e8:.0f} 亿")
+    else:
+        print("[实时行情] 接口不可用（以券商行情为准）")
+    print()
+
+    # -- 2. 公告 + 配售/可转债扫描 --
+    print(f"[配售/融资/可转债信号 (近 {lookback_days} 日公告扫描)]")
+    try:
+        anns = _fetch_announcements(c, page_size=40)
+    except Exception as e:
+        anns = []
+        print(f"- 公告接口失败 ({type(e).__name__})")
+    hits = _hk_overhang_scan(anns, lookback_days=lookback_days)
+    if hits:
+        for nd, title in hits[:10]:
+            print(f"- ⚠️ {nd}  {title[:80]}")
+        print(f"- ⚠️ 命中 {len(hits)} 条筹码事件：配售价=价格引力位/头顶抛压，"
+              f"反弹至配售价上方易遭翻本盘卖出")
+    else:
+        print(f"- ✅ 近 {lookback_days} 日无配售/供股/可转债公告命中")
+    if anns:
+        print("[近期公告 (近 10 条)]")
+        for a in anns[:10]:
+            d = (a.get("notice_date") or "")[:10]
+            t = (a.get("title") or "")[:70]
+            print(f"- {d}  {t}")
+    print()
+
+    # -- 3. 四项筹码清单 (强制披露框架) --
+    print("[四项筹码清单 -- 结论前逐项核对]")
+    print("1. 配售/增发: 见上方扫描（公告未含的历史配售价需人工补充）")
+    print("2. 解禁: 港股无统一公告口径——核对招股书基石/控股条款锁定到期日")
+    print("3. 可转债: 见上方扫描（转股价之上=悬顶抛压，注意到期/强赎条款）")
+    print("4. 南向/事件: 港股通假期(国庆/春节周)=南向缺席流动性真空；"
+          "FOMC/PCE 日=折现率重定价；业绩/ARR 披露=波动放大点")
+    print()
+    if hits:
+        print("[腹黑分析钩子 -- 上方命中项必须跑 Step A/D]")
+        print("- Step A 利益方图谱: 配售承配人/可转债持有人/解禁股东在现价的"
+              "盈亏与出货动机（配售价、转股价 vs 现价）")
+        print("- Step B 信息不对称: 公告日前 3 个交易日有无异常放量拉升（配合发行）")
+        print("- Step C 异常归因: 高开低走/放量滞涨 = 谁在借利好出货（who benefits）")
+        print("- Step D 动机-行为一致性: 公告说'扩产/融资发展'，行为是折价发行+"
+              "持续摊薄——信行为，别信叙事")
+    print()
+    print("[结论要求] 给出买卖结论前必须引用以上四项；"
+          "行情只是筹码结构的影子——薄流通盘个股尤其如此。")
 
 
 def has_bad_news(code, days=7, use_cache=True):
@@ -6874,6 +7000,52 @@ _KLT_15MIN = 15
 _KLT_60MIN = 60
 
 
+def _fetch_hk_minute_kline(code, klt, n):
+    """HK minute k-line via EM push2his (secid 116.xxxxx), klt in {5,15,30,60}.
+
+    BaoStock / Sina minute chains cover A-shares only; HK codes need this
+    dedicated path. fqt=0 (unadjusted) -- same rationale as the A-share
+    minute chain: no corporate action inside a single session.
+    Returns ascending [{ts, open, close, high, low, vol, amount}], [] on failure.
+    """
+    c = str(code).strip()
+    if len(c) != 5 or not c.isdigit():
+        return []
+    url = (
+        "http://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid=116.{c}&fields1=f1,f2,f3,f4,f5,f6"
+        "&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+        f"&klt={int(klt)}&fqt=0&lmt={int(n)}"
+        "&end=20500101&ut=fa5fd1943c7b386f172d6893dbfba10b"
+    )
+    try:
+        resp = _EM_KLINE_SESSION.get(url, timeout=8)
+        if resp.status_code != 200:
+            return []
+        js = resp.json()
+    except Exception:
+        return []
+    klines = ((js or {}).get("data") or {}).get("klines") or []
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        try:
+            rows.append({
+                "ts": parts[0],                            # "YYYY-MM-DD HH:MM"
+                "open": float(parts[1]),
+                "close": float(parts[2]),
+                "high": float(parts[3]),
+                "low": float(parts[4]),
+                "vol": float(parts[5]),
+                "amount": float(parts[6]),
+            })
+        except (ValueError, TypeError):
+            continue
+    return rows
+
+
 def _fetch_minute_kline(code, klt, n):
     """Fetch `n` recent minute-level k-lines (ascending).
 
@@ -6881,15 +7053,84 @@ def _fetch_minute_kline(code, klt, n):
     (no fqt option), but for intraday features this is fine: no dividend/split
     event within a single session.
 
-    Two-source chain, ordered by success rate:
-      1. BaoStock  -- server API, stable minute-line endpoint
-      2. Sina       -- public crawler, fallback when BaoStock unavailable
+    Source chain, ordered by coverage:
+      0. EM push2his -- HK codes (5-digit) only
+      1. BaoStock    -- server API, stable minute-line endpoint (A-share)
+      2. Sina        -- public crawler, fallback when BaoStock unavailable
     """
+    if _is_hk_code(str(code).strip()):
+        raw = _fetch_hk_minute_kline(code, klt, n)
+        if raw:
+            return raw
     period = str(klt)
     raw = _fetch_baostock_kline(code, n=n, period=period)
     if not raw:
         raw = _fetch_sina_kline(code, scale=klt, n=n)
     return raw
+
+
+def _cmd_hk_intraday(codes, klt=5, n=48):
+    """HK intraday snapshot for the trading loop: quote + minute bars + hints.
+
+    Designed for LLM consumption at a 5-minute decision cadence: one cheap
+    call (~3s) that prints realtime quote, today's minute bars, and a
+    pre-computed [HINT] matrix (MA / VWAP / volume ratio / momentum).
+    """
+    klt = int(klt) if int(klt) in (5, 15, 30, 60) else 5
+    n = max(10, min(int(n), 240))
+    data = get_minute_klines_batch([str(c).strip() for c in codes], klt, n)
+    for raw_c in codes:
+        c = str(raw_c).strip()
+        if c.isdigit():
+            c = c.zfill(5)
+        qt = _quote_em(c) or {}
+        bars = (data.get(c) if isinstance(data, dict) else None) or []
+        print(f"═══ 港股分钟行情: {qt.get('name') or c} ({c}) klt={klt} ═══")
+        if qt:
+            print(f"[QUOTE] price={qt.get('price')} pct={qt.get('pct')}% "
+                  f"open={qt.get('open')} high={qt.get('high')} low={qt.get('low')} "
+                  f"prev_close={qt.get('prev_close')} "
+                  f"amount={(qt.get('amount') or 0) / 1e8:.2f}亿 "
+                  f"volume_ratio={qt.get('volume_ratio')}")
+        else:
+            print("[QUOTE] (实时行情不可用)")
+        if not bars:
+            print("[BARS] (分钟K不可用)")
+            print()
+            continue
+        # 只保留今日 bar，避免隔夜数据污染均线/量比 hint
+        today = (bars[-1].get("ts") or "")[:10]
+        tbars = [b for b in bars if (b.get("ts") or "")[:10] == today] or bars[-n:]
+        closes = [b["close"] for b in tbars]
+        vols = [b["vol"] for b in tbars]
+
+        def _ma(k):
+            return (sum(closes[-k:]) / k) if len(closes) >= k else None
+
+        def _r2(v):
+            return round(v, 2) if v is not None else None
+
+        avg_v = (sum(vols[:-1]) / max(len(vols) - 1, 1)) if len(vols) > 1 else 0
+        v_ratio = (vols[-1] / avg_v) if avg_v else None
+        day_hi = max(b["high"] for b in tbars)
+        day_lo = min(b["low"] for b in tbars)
+        px = closes[-1]
+        pos = ((px - day_lo) / (day_hi - day_lo) * 100) if day_hi > day_lo else 50.0
+        chg30 = ((px / closes[-7] - 1) * 100) if len(closes) >= 7 else None
+        chg60 = ((px / closes[-13] - 1) * 100) if len(closes) >= 13 else None
+        vw = tot_v = None
+        tot_v = sum(vols)
+        if tot_v:
+            vw = sum(b["close"] * b["vol"] for b in tbars) / tot_v
+        print(f"[HINT] 今日bars={len(tbars)} MA5={_r2(_ma(5))} MA10={_r2(_ma(10))} "
+              f"MA20={_r2(_ma(20))} VWAP={_r2(vw)} 日内位置={pos:.0f}% "
+              f"尾bar量比={_r2(v_ratio)} 动量30m={_r2(chg30)}% 动量60m={_r2(chg60)}%")
+        print(f"[BARS] 最近 {min(len(tbars), n)} 根 (时间 O H L C vol):")
+        for b in tbars[-n:]:
+            tm = (b.get("ts") or "")[5:16]
+            print(f"    {tm}  {b['open']} {b['high']} {b['low']} {b['close']}  "
+                  f"{int(b['vol']):,}")
+        print()
 
 
 def get_minute_klines_batch(codes, klt, n, workers=8, use_cache=True):
@@ -14800,6 +15041,171 @@ def _session_label_now():
     return "after-close"
 
 
+def _resolve_hk_query(query):
+    """Resolve a query to a 5-digit HK code. Returns (code, name) or (None, None).
+    Accepts 5-digit codes (optional .HK suffix / missing leading zeros) or
+    names via EM suggest filtered to HK 5-digit codes."""
+    qq = (query or "").strip()
+    if qq.upper().endswith(".HK"):
+        qq = qq[:-3]
+    if qq.isdigit() and 1 <= len(qq) <= 5:
+        return qq.zfill(5), ""
+    if not qq:
+        return None, None
+    try:
+        for r in search_code(qq, count=8):
+            rc = (r.get("code") or "").strip()
+            if _is_hk_code(rc):
+                return rc, r.get("name", "")
+    except Exception:
+        pass
+    return None, None
+
+
+def analyze_hk(query, name="", include_news=True, days=120, minutes=32,
+               no_sample=False, compact=False):
+    """港股个股快照 -- 与 A 股 analyze 同构的数据块，供 LLM 消费。
+    差异: 无 A 股口径主力净流入/板块排名; 增加 [筹码风险披露]
+    (配售/可转债公告扫描 + 四项筹码清单, 见 hk_check)。
+    """
+    c = (query or "").strip()
+    if c.upper().endswith(".HK"):
+        c = c[:-3]
+    c = c.zfill(5) if (c.isdigit() and len(c) < 5) else c
+    if not _is_hk_code(c):
+        c2, nm2 = _resolve_hk_query(c)
+        if c2:
+            c, name = c2, (nm2 or name)
+    if not _is_hk_code(c):
+        print(f"❌ 港股查询 '{query}' 无法解析（支持 5 位代码或港股名称）")
+        return
+
+    days = max(5, min(days, 240))
+    minutes = max(5, min(minutes, 80))
+
+    qt = _quote_em(c) or {}
+    name = name or qt.get("name", "")
+    print(f"═══ 港股个股: {name or c} ({c}) ═══")
+    print()
+    print("[基本]")
+    print("- 市场: 港股 (行业/概念需人工补充)")
+    if qt:
+        print(f"- 总市值 {(qt.get('total_mv') or 0) / 1e8:.0f} 亿 | "
+              f"流通 {(qt.get('float_mv') or 0) / 1e8:.0f} 亿 | (港元计价)")
+    print()
+
+    print("[今日行情]")
+    if qt:
+        print(f"- 现价 {qt.get('price')}  {qt.get('pct', 0) or 0:+.2f}%")
+        print(f"- 开 {qt.get('open')}  高 {qt.get('high')}  低 {qt.get('low')}  "
+              f"昨收 {qt.get('prev_close')}")
+        print(f"- 成交额 {(qt.get('amount') or 0) / 1e8:.1f} 亿  "
+              f"量比 {qt.get('volume_ratio')}")
+    else:
+        print("- (行情不可用)")
+    print()
+
+    print(f"[日K序列 (近 {days} 日)]")
+    drows = get_daily_kline(c, n=days) or []
+    if drows:
+        closes = [float(r["close"]) for r in drows]
+
+        def _ma(n_):
+            return sum(closes[-n_:]) / n_ if len(closes) >= n_ else None
+
+        def _f(v):
+            return f"{v:.2f}" if v is not None else "-"
+
+        ma5, ma10 = _ma(5), _ma(10)
+        ma20, ma60 = _ma(20), _ma(60)
+        hi = max(float(r["high"]) for r in drows)
+        lo = min(float(r["low"]) for r in drows)
+        px = closes[-1]
+        pct_pos = (px - lo) / (hi - lo) * 100 if hi > lo else 50.0
+        trend = []
+        if ma5 and ma20:
+            trend.append("MA5>MA20 (多头)" if ma5 > ma20 else "MA5<MA20 (空头)")
+        elif ma20:
+            trend.append(f"价格{'上' if px >= ma20 else '下'}穿MA20")
+        print(f"- MA5/10/20/60: {_f(ma5)} / {_f(ma10)} / {_f(ma20)} / {_f(ma60)}")
+        print(f"- {len(drows)}日区间 [{lo:.2f} ~ {hi:.2f}]  "
+              f"当前位置 {pct_pos:.0f}% 分位")
+        print(f"- 趋势: 跌破MA5 / {' / '.join(trend) if trend else '—'}")
+        print("- ⚠️ 口径提示: 港股日K源与实时行情源存在缩放系数差，"
+              "均线/分位只取相对位置，绝对价位以[今日行情]为准")
+        # 采样规则与 A 股一致: 20日内每天 / 20-60日每2天 / 60+日每5天
+        tot = len(drows)
+        emit_rows = []
+        for i, r in enumerate(drows):
+            age = tot - 1 - i
+            if (no_sample or age < 20 or (age < 60 and age % 2 == 0)
+                    or age % 5 == 0):
+                emit_rows.append(r)
+        print(f"- OHLCV 序列 (采样后 {len(emit_rows)}/{tot} 根):")
+        for r in emit_rows:
+            op = float(r["open"]) or 0
+            pct_r = ((float(r["close"]) - op) / op * 100) if op else 0
+            sgn = "+" if pct_r >= 0 else ""
+            print(f"    {r['date']}  O{r['open']} H{r['high']} L{r['low']} "
+                  f"C{r['close']}  {sgn}{pct_r:.2f}%  "
+                  f"vol {int(r.get('vol', 0)):,}")
+    else:
+        print("- (日K数据不可用)")
+    print()
+
+    print(f"[15 分钟 K 原始序列 (近 {minutes} 根)]")
+    m15 = []
+    try:
+        m15 = get_minute_klines_batch([c], 15, minutes).get(c) or []
+    except Exception as e:
+        print(f"- 15分钟K获取失败 ({type(e).__name__})")
+    if m15:
+        for r in m15:
+            ts_full = r.get("ts", "")
+            tm = ts_full[5:16] if len(ts_full) >= 16 else ts_full
+            print(f"    {tm}  O{r['open']} H{r['high']} L{r['low']} "
+                  f"C{r['close']}  vol {int(r.get('vol', 0)):,}")
+    else:
+        print("- (15 分钟 K 不可用)")
+    print()
+
+    print("[资金面]")
+    print("- (港股无 A 股口径主力净流入；筹码面以下方[筹码风险披露]"
+          "+南向持股数据人工补充)")
+    if qt and qt.get("amount"):
+        print(f"- 参考成交额: {qt['amount'] / 1e8:.1f} 亿 (港元)")
+    print()
+
+    if include_news:
+        print("[公告 (近 15 条)]")
+        try:
+            anns = _fetch_announcements(c, page_size=20)
+        except Exception as e:
+            anns = []
+            print(f"- 公告接口失败 ({type(e).__name__})")
+        for a in anns[:15]:
+            d = (a.get("notice_date") or "")[:10]
+            t = (a.get("title") or "")[:70]
+            print(f"- {d}  {t}")
+        if not anns:
+            print("- (无近期公告)")
+        print()
+
+        hits = _hk_overhang_scan(anns, lookback_days=120)
+        print("[筹码风险披露 (强制 -- 结论前必读)]")
+        if hits:
+            for nd, t in hits[:10]:
+                print(f"- ⚠️ {nd}  {t[:80]}")
+            print("- ⚠️ 命中筹码事件：配售价=价格引力位/头顶抛压，"
+                  "反弹至配售价上方易遭翻本盘卖出")
+        else:
+            print("- ✅ 近120日无配售/供股/可转债公告命中")
+        print("- 解禁: 需人工核对招股书锁定条款 | 可转债: 转股价之上=悬顶")
+        print("- 南向/事件: 港股通假期=买盘缺席; FOMC/PCE=折现率重定价")
+        print("- 腹黑提示: 折价发行+持续摊薄的公司，信行为别信叙事 (Step A/D)")
+        print()
+
+
 def analyze(queries, include_news=True, days=120, minutes=32,
             no_sample=False, compact=False):
     """Emit comprehensive per-stock snapshots for LLM consumption.
@@ -14853,12 +15259,35 @@ def analyze(queries, include_news=True, days=120, minutes=32,
         seen_codes.add(code)
         resolved.append((q, code, name))
 
+    # ---- Step 2.5: 未解析查询的港股回退 (5位代码/港股名称) ----
+    # 港股走独立管线 analyze_hk: quote + 日K + 15m + 公告 + 筹码风险披露。
+    hk_done = False
+    still_unresolved = []
+    for q in unresolved:
+        hk_code, hk_name = _resolve_hk_query(q)
+        if hk_code:
+            try:
+                analyze_hk(hk_code, name=hk_name, include_news=include_news,
+                           days=days, minutes=minutes, no_sample=no_sample,
+                           compact=compact)
+                hk_done = True
+            except Exception as e:
+                print(f"⚠️ 港股分析失败 {hk_code} ({type(e).__name__}): {e}")
+            print()
+        else:
+            still_unresolved.append(q)
+    unresolved = still_unresolved
+
     if not resolved:
+        if hk_done:
+            return
         print("❌ 所有查询均无法解析为 A 股代码：")
         for q in unresolved:
             print(f"  - \"{q}\"")
         print("提示：支持 6 位代码、完整名称（如 \"贵州茅台\"）、"
               "或包含关键词的简称（如 \"茅台\"）")
+        print("港股支持 5 位代码或港股名称（如 02513 / 智谱）；"
+              "筹码风险四项清单可用 hk-check <代码> 单独输出")
         return
 
     codes = [c for _, c, _ in resolved]
@@ -15446,6 +15875,15 @@ def _build_cli():
     q = sub.add_parser("quote", help="Real-time quote (EM / Sina fallback).")
     q.add_argument("codes", nargs="+", help="One or more stock codes, e.g. 600519 000001")
 
+    hi = sub.add_parser("hk-intraday",
+                        help="HK intraday snapshot: realtime quote + minute "
+                             "kline + [HINT] matrix (for 5-min trading loop).")
+    hi.add_argument("codes", nargs="+", help="HK codes, e.g. 02513 00100")
+    hi.add_argument("--klt", type=int, default=5, choices=[5, 15, 30, 60],
+                    help="Minute scale (default 5)")
+    hi.add_argument("--n", type=int, default=48,
+                    help="Number of bars to print (default 48 = ~2h on 5min)")
+
     sr = sub.add_parser("search", help="Search by Chinese name or pinyin.")
     sr.add_argument("keyword")
     sr.add_argument("--count", type=int, default=5)
@@ -15454,6 +15892,15 @@ def _build_cli():
     k.add_argument("code")
     k.add_argument("--period", choices=["day", "week", "month"], default="day")
     k.add_argument("--count", type=int, default=30)
+
+    hc = sub.add_parser(
+        "hk-check",
+        help="HK-stock overhang disclosure: quote + placement/CB announcement "
+             "scan + southbound calendar (筹码风险四项清单)."
+    )
+    hc.add_argument("code", help="Hong Kong 5-digit code, e.g. 02513 00100")
+    hc.add_argument("--days", type=int, default=120,
+                    help="Overhang announcement lookback days (default 120)")
 
     # ------ allocate: 2nd-pass allocation table (LLM-driven priority list) ------
     al = sub.add_parser(
@@ -15561,6 +16008,10 @@ _KNOWN_CMDS = {
     "macro-sentiment",
     # tushare token management (Tier-4 k-line fallback enablement)
     "tushare-token",
+    # HK overhang disclosure (筹码风险四项清单)
+    "hk-check",
+    # HK intraday snapshot for the 5-min trading loop (quote + minute K + hints)
+    "hk-intraday",
 }
 
 
@@ -15731,10 +16182,14 @@ def _cli_main(argv=None):
         stats_recommendations(days=args.days)
     elif args.cmd == "quote":
         print_quotes(args.codes)
+    elif args.cmd == "hk-intraday":
+        _cmd_hk_intraday(args.codes, klt=args.klt, n=args.n)
     elif args.cmd == "search":
         print_search(args.keyword, args.count)
     elif args.cmd == "kline":
         print_kline_cli(args.code, period=args.period, count=args.count)
+    elif args.cmd == "hk-check":
+        hk_check(args.code, lookback_days=args.days)
     elif args.cmd == "allocate":
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
         cli_allocate(codes, args.capital, comment=args.comment,
