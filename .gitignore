@@ -7,3 +7,8 @@ scripts/__pycache__
 scripts/_build_full.py
 scripts/_check_kline.py
 scripts/_verify.py
+node_modules/
+__pycache__/
+cache/
+logs/
+*.pyc
