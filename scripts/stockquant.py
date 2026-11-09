@@ -7069,22 +7069,70 @@ def _fetch_minute_kline(code, klt, n):
     return raw
 
 
+def _stale_minute_bars(key, max_days=3):
+    """Last-resort BARS fallback: newest kline cache file across recent
+    day-dirs, ignoring TTL. Returns (rows, age_minutes) or (None, None).
+
+    Used only when live fetch is dead; callers MUST stamp the output as
+    non-decision-grade (定位用) -- 铁律: 数据失败宁可不动.
+    """
+    now = datetime.datetime.now()
+    for delta in range(max_days + 1):
+        d = (now - datetime.timedelta(days=delta)).strftime("%Y%m%d")
+        p = os.path.join(_CACHE_DIR, d, key)
+        if os.path.exists(p):
+            try:
+                age_min = (time.time() - os.path.getmtime(p)) / 60.0
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f), age_min
+            except Exception:
+                return None, None
+    return None, None
+
+
+def _fmt_bv(v):
+    """Compact bar-value formatter for revision notes (收/量 旧→新)."""
+    try:
+        f = float(v)
+        return f"{int(f):,}" if f.is_integer() else f"{f:g}"
+    except Exception:
+        return str(v)
+
+
 def _cmd_hk_intraday(codes, klt=5, n=48):
     """HK intraday snapshot for the trading loop: quote + minute bars + hints.
 
     Designed for LLM consumption at a 5-minute decision cadence: one cheap
     call (~3s) that prints realtime quote, today's minute bars, and a
     pre-computed [HINT] matrix (MA / VWAP / volume ratio / momentum).
+
+    2026-11-09 hardening -- three traps proven in live trading are now
+    mechanized in the output itself:
+      * per-bar finality marker: ✓ = has a successor bar (judgement-grade),
+        △ = last/forming bar (provisional, never a trigger bar);
+      * ↑修 revision flag: today's bars are diffed against the previous
+        snapshot actually *seen* (kline_seen_*), so a revised bar prints
+        收/量 旧→新; identical values from the same cached snapshot can
+        never fake a "两拍一致定稿";
+      * snapshot age + cache degradation: a BARS payload older than ~2 min
+        is stamped 快照age (same-snapshot risk), and when upstream is dead
+        the last successful snapshot is served loudly stamped 非决策级.
     """
     klt = int(klt) if int(klt) in (5, 15, 30, 60) else 5
     n = max(10, min(int(n), 240))
     data = get_minute_klines_batch([str(c).strip() for c in codes], klt, n)
+    health = []
     for raw_c in codes:
         c = str(raw_c).strip()
         if c.isdigit():
             c = c.zfill(5)
-        qt = _quote_em(c) or {}
+        qt = query_quote(c)   # EM -> Sina fallback (single-source EM dies more often)
+        if not qt or qt.get("name") == "NOT_FOUND":  # query_quote returns a sentinel dict on total failure
+            qt = {}
         bars = (data.get(c) if isinstance(data, dict) else None) or []
+        stale_min = None
+        if not bars:
+            bars, stale_min = _stale_minute_bars(f"kline_m{klt}_{n}_{c}.json")
         print(f"═══ 港股分钟行情: {qt.get('name') or c} ({c}) klt={klt} ═══")
         if qt:
             print(f"[QUOTE] price={qt.get('price')} pct={qt.get('pct')}% "
@@ -7095,12 +7143,21 @@ def _cmd_hk_intraday(codes, klt=5, n=48):
         else:
             print("[QUOTE] (实时行情不可用)")
         if not bars:
-            print("[BARS] (分钟K不可用)")
+            print("[BARS] (分钟K不可用，且无可用缓存)")
+            health.append((c, bool(qt), False, None, None, None))
             print()
             continue
         # 只保留今日 bar，避免隔夜数据污染均线/量比 hint
-        today = (bars[-1].get("ts") or "")[:10]
-        tbars = [b for b in bars if (b.get("ts") or "")[:10] == today] or bars[-n:]
+        day_str = (bars[-1].get("ts") or "")[:10]
+        tbars = [b for b in bars if (b.get("ts") or "")[:10] == day_str] or bars[-n:]
+        # 本快照的落盘时刻：>2 分钟说明本次输出极可能读自缓存（两拍同值无效）
+        snap_age = None
+        try:
+            snap_age = time.time() - os.path.getmtime(
+                _cache_path(f"kline_m{klt}_{n}_{c}.json"))
+        except Exception:
+            snap_age = None
+        last_ts = (tbars[-1].get("ts") or "?")[11:16] if tbars else None
         closes = [b["close"] for b in tbars]
         vols = [b["vol"] for b in tbars]
 
@@ -7110,27 +7167,80 @@ def _cmd_hk_intraday(codes, klt=5, n=48):
         def _r2(v):
             return round(v, 2) if v is not None else None
 
-        avg_v = (sum(vols[:-1]) / max(len(vols) - 1, 1)) if len(vols) > 1 else 0
-        v_ratio = (vols[-1] / avg_v) if avg_v else None
-        day_hi = max(b["high"] for b in tbars)
-        day_lo = min(b["low"] for b in tbars)
-        px = closes[-1]
-        pos = ((px - day_lo) / (day_hi - day_lo) * 100) if day_hi > day_lo else 50.0
-        chg30 = ((px / closes[-7] - 1) * 100) if len(closes) >= 7 else None
-        chg60 = ((px / closes[-13] - 1) * 100) if len(closes) >= 13 else None
-        vw = tot_v = None
-        tot_v = sum(vols)
-        if tot_v:
-            vw = sum(b["close"] * b["vol"] for b in tbars) / tot_v
-        print(f"[HINT] 今日bars={len(tbars)} MA5={_r2(_ma(5))} MA10={_r2(_ma(10))} "
-              f"MA20={_r2(_ma(20))} VWAP={_r2(vw)} 日内位置={pos:.0f}% "
-              f"尾bar量比={_r2(v_ratio)} 动量30m={_r2(chg30)}% 动量60m={_r2(chg60)}%")
-        print(f"[BARS] 最近 {min(len(tbars), n)} 根 (时间 O H L C vol):")
-        for b in tbars[-n:]:
+        if stale_min is None:
+            avg_v = (sum(vols[:-1]) / max(len(vols) - 1, 1)) if len(vols) > 1 else 0
+            v_ratio = (vols[-1] / avg_v) if avg_v else None
+            day_hi = max(b["high"] for b in tbars)
+            day_lo = min(b["low"] for b in tbars)
+            px = closes[-1]
+            pos = ((px - day_lo) / (day_hi - day_lo) * 100) if day_hi > day_lo else 50.0
+            chg30 = ((px / closes[-7] - 1) * 100) if len(closes) >= 7 else None
+            chg60 = ((px / closes[-13] - 1) * 100) if len(closes) >= 13 else None
+            vw = None
+            tot_v = sum(vols)
+            if tot_v:
+                vw = sum(b["close"] * b["vol"] for b in tbars) / tot_v
+            print(f"[HINT] 今日bars={len(tbars)} MA5={_r2(_ma(5))} MA10={_r2(_ma(10))} "
+                  f"MA20={_r2(_ma(20))} VWAP={_r2(vw)} 日内位置={pos:.0f}% "
+                  f"尾bar量比={_r2(v_ratio)} 动量30m={_r2(chg30)}% 动量60m={_r2(chg60)}%")
+        else:
+            print(f"[HINT]（⚠缓存降级数据，指标不计算——非决策级，仅供定位）")
+
+        # ↑修检测：与上一拍真正见过的快照逐根比对（缓存命中=同快照，天然零误报）
+        seen_key = f"kline_seen_{klt}_{c}.json"
+        seen = _cache_get(seen_key)
+        if not isinstance(seen, dict):
+            seen = {}
+        revs = {}
+        for b in tbars:
+            s = seen.get(b.get("ts") or "")
+            if not s:
+                continue
+            diffs = []
+            for fld, lab in (("close", "收"), ("vol", "量"), ("high", "高"),
+                             ("low", "低"), ("open", "开")):
+                old, new = s.get(fld), b.get(fld)
+                if old is not None and new is not None and old != new:
+                    diffs.append(f"{lab}{_fmt_bv(old)}→{_fmt_bv(new)}")
+            if diffs:
+                revs[b["ts"]] = " ".join(diffs[:3])
+
+        if stale_min is not None:
+            print(f"[BARS]（⚠缓存降级：末次成功抓取 {stale_min:.0f} 分钟前，非决策级仅供定位）"
+                  f" 最近 {min(len(tbars), n)} 根（✓=定稿可判定 △=forming 不作决策）：")
+        elif snap_age is not None and snap_age > 120:
+            print(f"[BARS]（快照抓取于 {int(snap_age)} 秒前：本次与上拍或为同一快照，两拍同值≠定稿）"
+                  f" 最近 {min(len(tbars), n)} 根（✓=定稿可判定 △=forming 不作决策 ↑修=较上次快照修订）：")
+        else:
+            print(f"[BARS] 最近 {min(len(tbars), n)} 根（✓=定稿可判定 △=forming 不作决策"
+                  f" ↑修=较上次快照修订）:")
+        for i, b in enumerate(tbars[-n:]):
             tm = (b.get("ts") or "")[5:16]
-            print(f"    {tm}  {b['open']} {b['high']} {b['low']} {b['close']}  "
-                  f"{int(b['vol']):,}")
+            mark = "△" if (stale_min is None and i == len(tbars[-n:]) - 1
+                           and b is tbars[-1]) else "✓"
+            rev_note = f"  ↑修[{revs[b['ts']] }]" if b.get("ts") in revs else ""
+            print(f"    {tm} {mark} {b['open']} {b['high']} {b['low']} {b['close']}  "
+                  f"{int(b['vol']):,}{rev_note}")
+        # 持久化本拍所见（仅当日），供下一拍做修订比对
+        for b in tbars:
+            seen[b.get("ts") or ""] = {k: b.get(k) for k in
+                                       ("open", "high", "low", "close", "vol")}
+        _cache_set(seen_key, {t: v for t, v in seen.items()
+                              if isinstance(t, str) and t.startswith(day_str)})
+        health.append((c, bool(qt), True, stale_min, last_ts, snap_age))
         print()
+    if health:
+        parts = []
+        for c, q_ok, b_ok, smin, lts, sage in health:
+            if not b_ok:
+                btxt = "BARS:✗"
+            elif smin is not None:
+                btxt = f"BARS:缓存降级(末根{lts},陈旧{smin:.0f}m,非决策级)"
+            else:
+                ag = f",快照{int(sage)}s" if (sage is not None and sage > 120) else ""
+                btxt = f"BARS:✓(末根{lts}{ag})"
+            parts.append(f"{c} QUOTE:{'✓' if q_ok else '✗'} {btxt}")
+        print("[通道健康] " + " | ".join(parts))
 
 
 def get_minute_klines_batch(codes, klt, n, workers=8, use_cache=True):
@@ -7159,6 +7269,16 @@ def get_minute_klines_batch(codes, klt, n, workers=8, use_cache=True):
                 rows = fut.result()
             except Exception:
                 rows = []
+            if not rows:
+                # Upstream flap windows are 1-2 decision rounds wide (observed
+                # 2026-11-02: fetch OK at 14:30, dead at 14:31). One immediate
+                # retry recovers most transient failures; failures are never
+                # written to cache, so nothing stale is served afterwards.
+                time.sleep(1.5)
+                try:
+                    rows = _fetch_minute_kline(code, klt, n)
+                except Exception:
+                    rows = []
             out[code] = rows
             if rows:
                 _cache_set(f"kline_m{klt}_{n}_{code}.json", rows)
