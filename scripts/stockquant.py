@@ -7186,6 +7186,35 @@ def _cmd_hk_intraday(codes, klt=5, n=48):
         else:
             print(f"[HINT]（⚠缓存降级数据，指标不计算——非决策级，仅供定位）")
 
+        # [日型] 日型判别变量：纯事实输出，"建议标签"仅为候选参考，决策权在使用方
+        if stale_min is None and len(tbars) >= 2:
+            _pc = qt.get("prev_close")
+            _op = qt.get("open") or tbars[0].get("open")  # 会话开盘含竞价，优先 QUOTE
+            try:
+                _gap = (_op / _pc - 1) * 100 if (_pc and _op) else None
+            except Exception:
+                _gap = None
+            _seg = tbars[:min(6, len(tbars))]  # 开盘30min段（klt=5 时 6 根）
+            _seg_lo = min(b["low"] for b in _seg)
+            _hold = None
+            if _op:
+                # 触及开盘价≠回补：跌破（<）才算破开盘，= 视为守住
+                _hold = "守住" if _seg_lo >= _op else "跌破"
+            _seg_v = sum(b["vol"] for b in _seg)
+            _avg_v = (sum(vols) / len(vols)) if vols else 0
+            _intx = (_seg_v / len(_seg) / _avg_v) if _avg_v else None
+            _tag = None
+            if _gap is not None and _hold:
+                if abs(_gap) >= 3 and _hold == "守住":
+                    _tag = "缺口趋势日候选"
+                elif _hold == "跌破":
+                    _tag = "开盘失守/squeeze候选"
+                else:
+                    _tag = "普通日候选"
+            print(f"[日型] 跳空={_r2(_gap)}%(开{_op}/昨收{_pc}) "
+                  f"开盘价30min:{_hold}(最低{_seg_lo}) "
+                  f"30min量强={_r2(_intx)}×全日均 | 建议标签={_tag or '数据不足'}")
+
         # ↑修检测：与上一拍真正见过的快照逐根比对（缓存命中=同快照，天然零误报）
         seen_key = f"kline_seen_{klt}_{c}.json"
         seen = _cache_get(seen_key)
